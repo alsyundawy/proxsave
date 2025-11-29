@@ -1,0 +1,107 @@
+name: Ultimate Security Analysis (Go)
+
+on:
+  push:
+    branches: [ "main", "dev" ]
+  pull_request:
+    branches: [ "main", "dev" ]
+  schedule:
+    - cron: "0 3 * * 1"
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  security:
+    runs-on: ubuntu-latest
+
+    steps:
+      ########################################
+      # CHECKOUT
+      ########################################
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      ########################################
+      # GO 1.25 — MAIN TOOLCHAIN
+      ########################################
+      - name: Set up Go 1.25
+        uses: actions/setup-go@v4
+        with:
+          go-version: "1.25"
+
+      - name: Show Go version
+        run: go version
+
+      ########################################
+      # STATICCHECK — RUNS NATIVELY ON GO 1.25
+      ########################################
+      - name: Install Staticcheck
+        run: go install honnef.co/go/tools/cmd/staticcheck@2025.1.1
+
+      - name: Run Staticcheck
+        run: staticcheck ./... || true
+
+      ########################################
+      # GOVULNCHECK — NATIVE
+      ########################################
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+
+      - name: Run govulncheck
+        run: govulncheck ./...
+
+      ########################################
+      # GOSEC — MUST RUN INSIDE GO 1.21
+      ########################################
+      - name: Run GoSec (Go 1.21 in Docker)
+        run: |
+          docker run --rm \
+          -v "$PWD":/work \
+          -w /work \
+          golang:1.21 sh -c "
+              go clean -modcache &&
+              go install github.com/securego/gosec/v2/cmd/gosec@v2.20.0 &&
+              echo 'Running GoSec...' &&
+              gosec -no-fail -fmt sarif -out gosec.sarif ./... || true &&
+              echo 'Files in /work:' &&
+              ls -al /work
+          "
+
+      ########################################
+      # VERIFY GOSEC SARIF EXISTS
+      ########################################
+      - name: Check GoSec SARIF file
+        run: |
+          echo "Checking SARIF validity..."
+          head -n 5 gosec.sarif
+          if [ ! -f gosec.sarif ]; then
+            exit 1
+            echo "ERROR: gosec.sarif NOT FOUND"
+            exit 1
+          fi
+
+      ########################################
+      # UPLOAD SARIF
+      ########################################
+      - name: Upload GoSec SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: gosec.sarif
+
+      ########################################
+      # CODEQL
+      ########################################
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: go
+
+      - name: Build the Go project
+        run: |
+          go mod tidy
+          go build ./...
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v4
