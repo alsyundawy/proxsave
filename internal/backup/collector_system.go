@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // CollectSystemInfo collects common system information (both PVE and PBS)
@@ -161,6 +162,30 @@ func (c *Collector) collectSystemDirectories(ctx context.Context) error {
 				file.desc); err != nil {
 				c.logger.Debug("Failed to collect %s: %v", file.path, err)
 			}
+		}
+
+		// Netplan configs (if present)
+		if err := c.safeCopyDir(ctx,
+			c.systemPath("/etc/netplan"),
+			filepath.Join(c.tempDir, "etc/netplan"),
+			"Netplan configuration"); err != nil {
+			c.logger.Debug("No /etc/netplan found")
+		}
+
+		// systemd-networkd configs (if present)
+		if err := c.safeCopyDir(ctx,
+			c.systemPath("/etc/systemd/network"),
+			filepath.Join(c.tempDir, "etc/systemd/network"),
+			"systemd-networkd configuration"); err != nil {
+			c.logger.Debug("No /etc/systemd/network found")
+		}
+
+		// NetworkManager connections (if present)
+		if err := c.safeCopyDir(ctx,
+			c.systemPath("/etc/NetworkManager/system-connections"),
+			filepath.Join(c.tempDir, "etc/NetworkManager/system-connections"),
+			"NetworkManager connections"); err != nil {
+			c.logger.Debug("No NetworkManager system-connections found")
 		}
 	}
 
@@ -438,6 +463,26 @@ func (c *Collector) collectSystemDirectories(ctx context.Context) error {
 		c.logger.Debug("No /etc/logrotate.d found")
 	}
 
+	// DHCP leases (best effort)
+	if err := c.safeCopyDir(ctx,
+		c.systemPath("/var/lib/dhcp"),
+		filepath.Join(c.tempDir, "var/lib/dhcp"),
+		"DHCP leases"); err != nil {
+		c.logger.Debug("No /var/lib/dhcp found")
+	}
+	if err := c.safeCopyDir(ctx,
+		c.systemPath("/var/lib/NetworkManager"),
+		filepath.Join(c.tempDir, "var/lib/NetworkManager"),
+		"NetworkManager leases"); err != nil {
+		c.logger.Debug("No /var/lib/NetworkManager leases found")
+	}
+	if err := c.safeCopyDir(ctx,
+		c.systemPath("/run/systemd/netif/leases"),
+		filepath.Join(c.tempDir, "run/systemd/netif/leases"),
+		"systemd-networkd leases"); err != nil {
+		c.logger.Debug("No /run/systemd/netif/leases found")
+	}
+
 	c.logger.Debug("System directories collected")
 	return nil
 }
@@ -494,6 +539,16 @@ func (c *Collector) collectSystemCommands(ctx context.Context) error {
 		return err
 	}
 
+	// Policy routing rules
+	if err := c.collectCommandMulti(ctx,
+		"ip rule show",
+		filepath.Join(commandsDir, "ip_rule.txt"),
+		"IP rules",
+		false,
+		filepath.Join(infoDir, "ip_rule.txt")); err != nil {
+		return err
+	}
+
 	// IP routes
 	if err := c.collectCommandMulti(ctx,
 		"ip route show",
@@ -504,12 +559,70 @@ func (c *Collector) collectSystemCommands(ctx context.Context) error {
 		return err
 	}
 
+	// All routing tables (IPv4/IPv6)
+	c.collectCommandOptional(ctx,
+		"ip -4 route show table all",
+		filepath.Join(commandsDir, "ip_route_all_v4.txt"),
+		"IP routes (all tables v4)",
+		filepath.Join(infoDir, "ip_route_all_v4.txt"))
+	c.collectCommandOptional(ctx,
+		"ip -6 route show table all",
+		filepath.Join(commandsDir, "ip_route_all_v6.txt"),
+		"IP routes (all tables v6)",
+		filepath.Join(infoDir, "ip_route_all_v6.txt"))
+
 	// IP link statistics
 	c.collectCommandOptional(ctx,
 		"ip -s link",
 		filepath.Join(commandsDir, "ip_link.txt"),
 		"IP link statistics",
 		filepath.Join(infoDir, "ip_link.txt"))
+
+	// Neighbors (ARP/NDP)
+	c.safeCmdOutput(ctx,
+		"ip neigh show",
+		filepath.Join(commandsDir, "ip_neigh.txt"),
+		"Neighbor table",
+		false)
+	c.safeCmdOutput(ctx,
+		"ip -6 neigh show",
+		filepath.Join(commandsDir, "ip6_neigh.txt"),
+		"Neighbor table (IPv6)",
+		false)
+
+	// Bridge/VLAN/FDB/MDB state
+	c.collectCommandOptional(ctx,
+		"bridge -d link show",
+		filepath.Join(commandsDir, "bridge_link.txt"),
+		"Bridge links")
+	c.collectCommandOptional(ctx,
+		"bridge vlan show",
+		filepath.Join(commandsDir, "bridge_vlan.txt"),
+		"Bridge VLANs")
+	c.collectCommandOptional(ctx,
+		"bridge fdb show",
+		filepath.Join(commandsDir, "bridge_fdb.txt"),
+		"Bridge FDB")
+	c.collectCommandOptional(ctx,
+		"bridge mdb show",
+		filepath.Join(commandsDir, "bridge_mdb.txt"),
+		"Bridge MDB")
+
+	// Bonding status (/proc/net/bonding/*)
+	if entries, err := os.ReadDir(c.systemPath("/proc/net/bonding")); err == nil {
+		for _, entry := range entries {
+			if entry.IsDir() {
+				continue
+			}
+			src := c.systemPath(filepath.Join("/proc/net/bonding", entry.Name()))
+			dest := filepath.Join(commandsDir, "bonding_"+entry.Name()+".txt")
+			if err := c.safeCopyFile(ctx, src, dest, "Bonding status"); err != nil && !errors.Is(err, os.ErrNotExist) {
+				c.logger.Debug("Failed to copy bonding status for %s: %v", entry.Name(), err)
+			}
+		}
+	} else {
+		c.logger.Debug("No bonding interfaces found")
+	}
 
 	// DNS resolver
 	resolvPath := c.systemPath("/etc/resolv.conf")
@@ -636,6 +749,11 @@ func (c *Collector) collectSystemCommands(ctx context.Context) error {
 			return err
 		}
 
+		c.collectCommandOptional(ctx,
+			"iptables -t nat -vnL --line-numbers",
+			filepath.Join(commandsDir, "iptables_nat.txt"),
+			"iptables NAT table")
+
 		// ip6tables
 		if err := c.collectCommandMulti(ctx,
 			"ip6tables-save",
@@ -646,12 +764,43 @@ func (c *Collector) collectSystemCommands(ctx context.Context) error {
 			return err
 		}
 
+		c.collectCommandOptional(ctx,
+			"ip6tables -t nat -vnL --line-numbers",
+			filepath.Join(commandsDir, "ip6tables_nat.txt"),
+			"ip6tables NAT table")
+
 		// nftables
 		c.safeCmdOutput(ctx,
 			"nft list ruleset",
 			filepath.Join(commandsDir, "nftables.txt"),
 			"nftables rules",
 			false)
+
+		// UFW status
+		c.collectCommandOptional(ctx,
+			"ufw status verbose",
+			filepath.Join(commandsDir, "ufw_status.txt"),
+			"UFW status")
+
+		// firewalld status
+		c.collectCommandOptional(ctx,
+			"firewall-cmd --state",
+			filepath.Join(commandsDir, "firewalld_state.txt"),
+			"firewalld state")
+		c.collectCommandOptional(ctx,
+			"firewall-cmd --list-all",
+			filepath.Join(commandsDir, "firewalld_list_all.txt"),
+			"firewalld rules")
+
+		// Service state for ufw/firewalld (best effort)
+		c.collectCommandOptional(ctx,
+			"systemctl status --no-pager ufw",
+			filepath.Join(commandsDir, "systemctl_ufw.txt"),
+			"systemctl ufw")
+		c.collectCommandOptional(ctx,
+			"systemctl status --no-pager firewalld",
+			filepath.Join(commandsDir, "systemctl_firewalld.txt"),
+			"systemctl firewalld")
 	}
 
 	// Loaded kernel modules
@@ -730,6 +879,128 @@ func (c *Collector) collectSystemCommands(ctx context.Context) error {
 	}
 
 	c.logger.Debug("System command output collection finished")
+	if err := c.buildNetworkReport(ctx, commandsDir, infoDir); err != nil {
+		c.logger.Debug("Network report generation failed: %v", err)
+	}
+	return nil
+}
+
+// buildNetworkReport composes a single human-readable network report by aggregating
+// key command outputs and configuration files.
+func (c *Collector) buildNetworkReport(ctx context.Context, commandsDir, infoDir string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	reportPath := filepath.Join(commandsDir, "network_report.txt")
+	mirrorPath := filepath.Join(infoDir, "network_report.txt")
+
+	var b strings.Builder
+	now := time.Now().Format(time.RFC3339)
+	hostname, _ := os.Hostname()
+	b.WriteString("Proxsave Network Report\n")
+	b.WriteString(fmt.Sprintf("Timestamp: %s\n", now))
+	b.WriteString(fmt.Sprintf("Hostname: %s\n", hostname))
+	b.WriteString("\n")
+
+	appendFile := func(title, path string) {
+		if path == "" {
+			return
+		}
+		data, err := os.ReadFile(path)
+		if err != nil || len(data) == 0 {
+			return
+		}
+		b.WriteString(fmt.Sprintf("## %s (%s)\n", title, path))
+		b.Write(data)
+		if !strings.HasSuffix(string(data), "\n") {
+			b.WriteString("\n")
+		}
+		b.WriteString("\n")
+	}
+
+	appendGlob := func(title, pattern string) {
+		matches, err := filepath.Glob(pattern)
+		if err != nil || len(matches) == 0 {
+			return
+		}
+		for _, m := range matches {
+			appendFile(title, m)
+		}
+	}
+
+	// Config files (best effort)
+	appendFile("interfaces", c.systemPath("/etc/network/interfaces"))
+	appendGlob("interfaces.d", filepath.Join(c.systemPath("/etc/network/interfaces.d"), "*"))
+	appendFile("hostname", c.systemPath("/etc/hostname"))
+	appendFile("hosts", c.systemPath("/etc/hosts"))
+	appendFile("resolv.conf", c.systemPath("/etc/resolv.conf"))
+	appendGlob("netplan", filepath.Join(c.systemPath("/etc/netplan"), "*.yaml"))
+	appendGlob("systemd-networkd", filepath.Join(c.systemPath("/etc/systemd/network"), "*.network"))
+	appendGlob("systemd-networkd", filepath.Join(c.systemPath("/etc/systemd/network"), "*.netdev"))
+	appendGlob("systemd-networkd", filepath.Join(c.systemPath("/etc/systemd/network"), "*.link"))
+	appendGlob("NetworkManager connection", filepath.Join(c.systemPath("/etc/NetworkManager/system-connections"), "*"))
+
+	// Command outputs already collected
+	commandFiles := []struct {
+		title string
+		name  string
+	}{
+		{"IP addresses", "ip_addr.txt"},
+		{"IP routes", "ip_route.txt"},
+		{"IP routes (all tables v4)", "ip_route_all_v4.txt"},
+		{"IP routes (all tables v6)", "ip_route_all_v6.txt"},
+		{"IP rules", "ip_rule.txt"},
+		{"IP links (stats)", "ip_link.txt"},
+		{"Neighbors (ARP/NDP)", "ip_neigh.txt"},
+		{"Neighbors (IPv6)", "ip6_neigh.txt"},
+		{"Bridge links", "bridge_link.txt"},
+		{"Bridge VLANs", "bridge_vlan.txt"},
+		{"Bridge FDB", "bridge_fdb.txt"},
+		{"Bridge MDB", "bridge_mdb.txt"},
+		{"Bonding status", "bonding.txt"},
+		{"iptables-save", "iptables.txt"},
+		{"iptables NAT table", "iptables_nat.txt"},
+		{"ip6tables-save", "ip6tables.txt"},
+		{"ip6tables NAT table", "ip6tables_nat.txt"},
+		{"nftables ruleset", "nftables.txt"},
+		{"UFW status", "ufw_status.txt"},
+		{"firewalld state", "firewalld_state.txt"},
+		{"firewalld rules", "firewalld_list_all.txt"},
+		{"systemctl ufw", "systemctl_ufw.txt"},
+		{"systemctl firewalld", "systemctl_firewalld.txt"},
+	}
+
+	for _, cf := range commandFiles {
+		appendFile(cf.title, filepath.Join(commandsDir, cf.name))
+	}
+
+	// Bonding: include each collected bonding_* file
+	if entries, err := os.ReadDir(commandsDir); err == nil {
+		for _, entry := range entries {
+			if entry.IsDir() {
+				continue
+			}
+			name := entry.Name()
+			if strings.HasPrefix(name, "bonding_") {
+				appendFile("Bonding status", filepath.Join(commandsDir, name))
+			}
+		}
+	}
+
+	reportData := []byte(b.String())
+	if len(reportData) == 0 {
+		return nil
+	}
+
+	if err := c.writeReportFile(reportPath, reportData); err != nil {
+		return err
+	}
+	if mirrorPath != "" {
+		if err := c.writeReportFile(mirrorPath, reportData); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 

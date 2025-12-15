@@ -188,6 +188,133 @@ func TestSanitizeFilename(t *testing.T) {
 	}
 }
 
+func TestCollectSystemDirectoriesCopiesAltNetConfigsAndLeases(t *testing.T) {
+	collector := newTestCollector(t)
+	root := t.TempDir()
+	collector.config.SystemRootPrefix = root
+
+	// Alternate network configs
+	netplanDir := filepath.Join(root, "etc", "netplan")
+	systemdNetDir := filepath.Join(root, "etc", "systemd", "network")
+	nmDir := filepath.Join(root, "etc", "NetworkManager", "system-connections")
+	for _, dir := range []string{netplanDir, systemdNetDir, nmDir} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("failed to create %s: %v", dir, err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(netplanDir, "01-netcfg.yaml"), []byte("network: {}\n"), 0o644); err != nil {
+		t.Fatalf("failed to write netplan file: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(systemdNetDir, "10-eth0.network"), []byte("[Match]\nName=eth0\n"), 0o644); err != nil {
+		t.Fatalf("failed to write systemd-networkd file: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(nmDir, "conn.nmconnection"), []byte("[connection]\nid=test\n"), 0o600); err != nil {
+		t.Fatalf("failed to write NetworkManager file: %v", err)
+	}
+
+	// DHCP leases
+	dhcpDirs := []string{
+		filepath.Join(root, "var", "lib", "dhcp"),
+		filepath.Join(root, "var", "lib", "NetworkManager"),
+		filepath.Join(root, "run", "systemd", "netif", "leases"),
+	}
+	for _, dir := range dhcpDirs {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("failed to create lease dir %s: %v", dir, err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "lease.test"), []byte("lease"), 0o644); err != nil {
+			t.Fatalf("failed to write lease in %s: %v", dir, err)
+		}
+	}
+
+	if err := collector.collectSystemDirectories(context.Background()); err != nil {
+		t.Fatalf("collectSystemDirectories failed: %v", err)
+	}
+
+	paths := []string{
+		filepath.Join(collector.tempDir, "etc", "netplan", "01-netcfg.yaml"),
+		filepath.Join(collector.tempDir, "etc", "systemd", "network", "10-eth0.network"),
+		filepath.Join(collector.tempDir, "etc", "NetworkManager", "system-connections", "conn.nmconnection"),
+		filepath.Join(collector.tempDir, "var", "lib", "dhcp", "lease.test"),
+		filepath.Join(collector.tempDir, "var", "lib", "NetworkManager", "lease.test"),
+		filepath.Join(collector.tempDir, "run", "systemd", "netif", "leases", "lease.test"),
+	}
+	for _, p := range paths {
+		if _, err := os.Stat(p); err != nil {
+			t.Fatalf("expected copied file %s: %v", p, err)
+		}
+	}
+}
+
+func TestBuildNetworkReportAggregatesOutputs(t *testing.T) {
+	collector := newTestCollector(t)
+	root := t.TempDir()
+	collector.config.SystemRootPrefix = root
+
+	// Config files
+	netDir := filepath.Join(root, "etc", "network")
+	if err := os.MkdirAll(netDir, 0o755); err != nil {
+		t.Fatalf("failed to create %s: %v", netDir, err)
+	}
+	if err := os.WriteFile(filepath.Join(netDir, "interfaces"), []byte("auto lo\niface lo inet loopback\n"), 0o644); err != nil {
+		t.Fatalf("failed to write interfaces: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "etc"), 0o755); err != nil {
+		t.Fatalf("failed to create /etc in root: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "etc", "resolv.conf"), []byte("nameserver 1.1.1.1\n"), 0o644); err != nil {
+		t.Fatalf("failed to write resolv.conf: %v", err)
+	}
+
+	commandsDir := filepath.Join(collector.tempDir, "commands")
+	infoDir := filepath.Join(collector.tempDir, "var/lib/proxsave-info")
+	for _, dir := range []string{commandsDir, infoDir} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("failed to create dir %s: %v", dir, err)
+		}
+	}
+
+	writeCmd := func(name, content string) {
+		if err := os.WriteFile(filepath.Join(commandsDir, name), []byte(content), 0o644); err != nil {
+			t.Fatalf("failed to write %s: %v", name, err)
+		}
+	}
+
+	writeCmd("ip_addr.txt", "1: lo: <LOOPBACK>\n")
+	writeCmd("ip_route.txt", "default via 192.0.2.1 dev eth0\n")
+	writeCmd("ip_rule.txt", "0:	from all lookup local\n")
+	writeCmd("ip_route_all_v4.txt", "local 127.0.0.0/8 dev lo\n")
+	writeCmd("iptables_nat.txt", "PREROUTING\n")
+	writeCmd("iptables.txt", "*nat\nCOMMIT\n")
+	writeCmd("nftables.txt", "table inet filter {}\n")
+	writeCmd("ufw_status.txt", "Status: inactive\n")
+	writeCmd("bridge_link.txt", "2: br0: <BROADCAST>\n")
+	if err := os.WriteFile(filepath.Join(commandsDir, "bonding_eth0.txt"), []byte("Bonding Mode: active-backup\n"), 0o644); err != nil {
+		t.Fatalf("failed to write bonding status: %v", err)
+	}
+
+	if err := collector.buildNetworkReport(context.Background(), commandsDir, infoDir); err != nil {
+		t.Fatalf("buildNetworkReport failed: %v", err)
+	}
+
+	reportPath := filepath.Join(commandsDir, "network_report.txt")
+	report, err := os.ReadFile(reportPath)
+	if err != nil {
+		t.Fatalf("expected network_report.txt: %v", err)
+	}
+	text := string(report)
+	for _, want := range []string{"Proxsave Network Report", "ip_addr", "default via", "nameserver 1.1.1.1", "Bonding Mode"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("network report missing %q in:\n%s", want, text)
+		}
+	}
+
+	mirror := filepath.Join(infoDir, "network_report.txt")
+	if _, err := os.Stat(mirror); err != nil {
+		t.Fatalf("expected mirrored report at %s: %v", mirror, err)
+	}
+}
+
 func newTestCollector(t *testing.T) *Collector {
 	t.Helper()
 	return newTestCollectorWithDeps(t, CollectorDeps{})
