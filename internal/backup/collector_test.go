@@ -547,3 +547,132 @@ func TestCollectorClusteredPVEFlag(t *testing.T) {
 		t.Fatalf("expected IsClusteredPVE to reflect flag")
 	}
 }
+
+func TestSafeCopyFile_SymlinkRelative(t *testing.T) {
+	logger := logging.New(types.LogLevelInfo, false)
+	config := GetDefaultCollectorConfig()
+	tempDir := t.TempDir()
+
+	collector := NewCollector(logger, config, tempDir, types.ProxmoxVE, false)
+	ctx := context.Background()
+
+	// Create a target file and a symlink to it
+	targetFile := filepath.Join(tempDir, "target.txt")
+	if err := os.WriteFile(targetFile, []byte("target content"), 0644); err != nil {
+		t.Fatalf("Failed to create target file: %v", err)
+	}
+
+	symlinkPath := filepath.Join(tempDir, "symlink.txt")
+	if err := os.Symlink("target.txt", symlinkPath); err != nil {
+		t.Fatalf("Failed to create symlink: %v", err)
+	}
+
+	// Copy the symlink
+	destPath := filepath.Join(tempDir, "dest", "symlink.txt")
+	if err := collector.safeCopyFile(ctx, symlinkPath, destPath, "test symlink"); err != nil {
+		t.Fatalf("safeCopyFile failed for symlink: %v", err)
+	}
+
+	// Verify destination is a symlink
+	info, err := os.Lstat(destPath)
+	if err != nil {
+		t.Fatalf("Failed to stat destination: %v", err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Error("Destination is not a symlink")
+	}
+
+	// Verify symlink target
+	target, err := os.Readlink(destPath)
+	if err != nil {
+		t.Fatalf("Failed to read symlink: %v", err)
+	}
+	if target != "target.txt" {
+		t.Errorf("Symlink target mismatch: expected 'target.txt', got '%s'", target)
+	}
+}
+
+func TestSafeCopyFile_SymlinkAbsolute(t *testing.T) {
+	logger := logging.New(types.LogLevelInfo, false)
+	config := GetDefaultCollectorConfig()
+	tempDir := t.TempDir()
+
+	collector := NewCollector(logger, config, tempDir, types.ProxmoxVE, false)
+	ctx := context.Background()
+
+	// Create a target file and a symlink with absolute path
+	targetFile := filepath.Join(tempDir, "target.txt")
+	if err := os.WriteFile(targetFile, []byte("target content"), 0644); err != nil {
+		t.Fatalf("Failed to create target file: %v", err)
+	}
+
+	symlinkPath := filepath.Join(tempDir, "symlink_abs.txt")
+	if err := os.Symlink(targetFile, symlinkPath); err != nil {
+		t.Fatalf("Failed to create symlink: %v", err)
+	}
+
+	// Copy the symlink
+	destPath := filepath.Join(tempDir, "dest", "symlink_abs.txt")
+	if err := collector.safeCopyFile(ctx, symlinkPath, destPath, "test symlink absolute"); err != nil {
+		t.Fatalf("safeCopyFile failed for absolute symlink: %v", err)
+	}
+
+	// Verify destination is a symlink
+	info, err := os.Lstat(destPath)
+	if err != nil {
+		t.Fatalf("Failed to stat destination: %v", err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Error("Destination is not a symlink")
+	}
+
+	// Verify symlink target is absolute
+	target, err := os.Readlink(destPath)
+	if err != nil {
+		t.Fatalf("Failed to read symlink: %v", err)
+	}
+	if !filepath.IsAbs(target) {
+		t.Errorf("Expected absolute symlink target, got '%s'", target)
+	}
+}
+
+func TestSafeCopyFile_SymlinkCreationFailure_ErrorFormat(t *testing.T) {
+	// This test verifies that symlink creation failures return an error
+	// with a properly formatted message for notification parsing
+
+	logger := logging.New(types.LogLevelDebug, false)
+	config := GetDefaultCollectorConfig()
+	tempDir := t.TempDir()
+
+	collector := NewCollector(logger, config, tempDir, types.ProxmoxVE, false)
+	ctx := context.Background()
+
+	origSymlink := osSymlink
+	t.Cleanup(func() { osSymlink = origSymlink })
+	osSymlink = func(oldname, newname string) error { return syscall.EPERM }
+
+	// Create a symlink pointing to a non-existent target (this is valid)
+	symlinkPath := filepath.Join(tempDir, "broken_symlink.txt")
+	if err := os.Symlink("/nonexistent/target", symlinkPath); err != nil {
+		t.Fatalf("Failed to create broken symlink: %v", err)
+	}
+
+	destPath := filepath.Join(tempDir, "dest", "broken_symlink.txt")
+
+	// The safeCopyFile should return an error for symlink creation failures
+	err := collector.safeCopyFile(ctx, symlinkPath, destPath, "test broken symlink")
+	if err == nil {
+		t.Fatal("Expected error for symlink creation failure, got nil")
+	}
+
+	// Verify error message uses structured format with " - " separator
+	errMsg := err.Error()
+	if !strings.Contains(errMsg, "Symlink creation failed - ") {
+		t.Errorf("Error message should use structured format with ' - ' separator, got: %s", errMsg)
+	}
+
+	// Verify that FilesFailed was incremented
+	if collector.stats.FilesFailed == 0 {
+		t.Error("FilesFailed counter should be incremented for symlink failure")
+	}
+}

@@ -56,6 +56,8 @@ type Collector struct {
 	clusteredPVE bool
 }
 
+var osSymlink = os.Symlink
+
 func (c *Collector) incFilesProcessed() {
 	atomic.AddInt64(&c.stats.FilesProcessed, 1)
 }
@@ -634,7 +636,7 @@ func (c *Collector) safeCopyFile(ctx context.Context, src, dest, description str
 		target, err := os.Readlink(src)
 		if err != nil {
 			c.incFilesFailed()
-			return fmt.Errorf("failed to read symlink %s: %w", src, err)
+			return fmt.Errorf("Symlink read failed - path: %s: %w", src, err)
 		}
 
 		if err := c.ensureDir(filepath.Dir(dest)); err != nil {
@@ -647,13 +649,14 @@ func (c *Collector) safeCopyFile(ctx context.Context, src, dest, description str
 		if _, err := os.Lstat(dest); err == nil {
 			if err := os.Remove(dest); err != nil {
 				c.incFilesFailed()
-				return fmt.Errorf("failed to replace existing file %s: %w", dest, err)
+				return fmt.Errorf("File replacement failed - path: %s: %w", dest, err)
 			}
 		}
 
-		if err := os.Symlink(target, dest); err != nil {
+		if err := osSymlink(target, dest); err != nil {
 			c.incFilesFailed()
-			return fmt.Errorf("failed to create symlink %s -> %s: %w", dest, target, err)
+			return fmt.Errorf("Symlink creation failed - source: %s, target: %s, absolute: %v: %w",
+				src, target, filepath.IsAbs(target), err)
 		}
 
 		c.applySymlinkOwnership(dest, info)
