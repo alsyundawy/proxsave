@@ -57,6 +57,11 @@ type Collector struct {
 }
 
 var osSymlink = os.Symlink
+var osReadlink = os.Readlink
+var osOpen = os.Open
+var osOpenFile = func(name string, flag int, perm os.FileMode) (io.WriteCloser, error) {
+	return os.OpenFile(name, flag, perm)
+}
 
 func (c *Collector) incFilesProcessed() {
 	atomic.AddInt64(&c.stats.FilesProcessed, 1)
@@ -633,10 +638,10 @@ func (c *Collector) safeCopyFile(ctx context.Context, src, dest, description str
 
 	// Handle symbolic links by recreating the link
 	if info.Mode()&os.ModeSymlink != 0 {
-		target, err := os.Readlink(src)
+		target, err := osReadlink(src)
 		if err != nil {
 			c.incFilesFailed()
-			return fmt.Errorf("Symlink read failed - path: %s: %w", src, err)
+			return fmt.Errorf("symlink read failed - path: %s: %w", src, err)
 		}
 
 		if err := c.ensureDir(filepath.Dir(dest)); err != nil {
@@ -649,13 +654,13 @@ func (c *Collector) safeCopyFile(ctx context.Context, src, dest, description str
 		if _, err := os.Lstat(dest); err == nil {
 			if err := os.Remove(dest); err != nil {
 				c.incFilesFailed()
-				return fmt.Errorf("File replacement failed - path: %s: %w", dest, err)
+				return fmt.Errorf("file replacement failed - path: %s: %w", dest, err)
 			}
 		}
 
 		if err := osSymlink(target, dest); err != nil {
 			c.incFilesFailed()
-			return fmt.Errorf("Symlink creation failed - source: %s, target: %s, absolute: %v: %w",
+			return fmt.Errorf("symlink creation failed - source: %s, target: %s, absolute: %v: %w",
 				src, target, filepath.IsAbs(target), err)
 		}
 
@@ -680,7 +685,7 @@ func (c *Collector) safeCopyFile(ctx context.Context, src, dest, description str
 	c.applyDirectoryMetadataFromSource(filepath.Dir(src), filepath.Dir(dest))
 
 	// Open source file
-	srcFile, err := os.Open(src)
+	srcFile, err := osOpen(src)
 	if err != nil {
 		c.incFilesFailed()
 		return fmt.Errorf("failed to open %s: %w", src, err)
@@ -688,7 +693,7 @@ func (c *Collector) safeCopyFile(ctx context.Context, src, dest, description str
 	defer srcFile.Close()
 
 	// Create destination file with a safe default mode; we'll apply the original metadata after copy.
-	destFile, err := os.OpenFile(dest, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	destFile, err := osOpenFile(dest, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
 	if err != nil {
 		c.incFilesFailed()
 		return fmt.Errorf("failed to create %s: %w", dest, err)
@@ -1133,9 +1138,8 @@ func (c *Collector) captureCommandOutput(ctx context.Context, cmd, output, descr
 		if parts[0] == "systemctl" && len(parts) >= 2 && parts[1] == "status" {
 			unit := parts[len(parts)-1]
 			if exitCode == 4 || strings.Contains(outputText, "could not be found") {
-				c.logger.Warning("Skipping %s: unit %s.service not found (likely not installed). Non-critical; backup continues. If expected, ignore; otherwise install/enable %s or disable firewall collection.",
+				c.logger.Warning("Skipping %s: %s.service not found (not installed?). Set BACKUP_FIREWALL_RULES=false to disable.",
 					description,
-					unit,
 					unit,
 				)
 				return nil, nil

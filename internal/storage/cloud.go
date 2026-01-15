@@ -169,8 +169,11 @@ func (c *CloudStorage) IsCritical() bool {
 }
 
 // DetectFilesystem checks if rclone is available and the remote is accessible
-func (c *CloudStorage) DetectFilesystem(ctx context.Context) (*FilesystemInfo, error) {
+func (c *CloudStorage) DetectFilesystem(ctx context.Context) (info *FilesystemInfo, err error) {
+	done := logging.DebugStart(c.logger, "cloud detect filesystem", "remote=%s", c.remoteLabel())
+	defer func() { done(err) }()
 	// Check if rclone is available
+	logging.DebugStep(c.logger, "cloud detect filesystem", "checking rclone availability")
 	if !c.hasRclone() {
 		c.logger.Warning("WARNING: rclone not found in PATH - cloud backup will be skipped")
 		c.logger.Warning("WARNING: Install rclone to enable cloud backups")
@@ -190,6 +193,7 @@ func (c *CloudStorage) DetectFilesystem(ctx context.Context) (*FilesystemInfo, e
 		c.remoteLabel(),
 		c.config.RcloneTimeoutConnection)
 
+	logging.DebugStep(c.logger, "cloud detect filesystem", "checking remote accessibility")
 	if err := c.checkRemoteAccessible(ctx); err != nil {
 		var rcErr *remoteCheckError
 		if errors.As(err, &rcErr) {
@@ -228,6 +232,7 @@ func (c *CloudStorage) DetectFilesystem(ctx context.Context) (*FilesystemInfo, e
 	}
 
 	c.logger.Info("Cloud remote %s is accessible", c.remoteLabel())
+	logging.DebugStep(c.logger, "cloud detect filesystem", "remote accessible")
 
 	// Return minimal filesystem info (cloud doesn't have a real filesystem type)
 	return &FilesystemInfo{
@@ -478,13 +483,19 @@ func (c *CloudStorage) shouldFallbackToWriteTest(err *remoteCheckError, ctx cont
 
 func classifyRemoteError(stage, target string, err error, output []byte) error {
 	text := strings.ToLower(strings.TrimSpace(string(output)))
-	msg := fmt.Sprintf("rclone %s check failed for %s", stage, target)
-
 	kind := detectRemoteErrorKind(text)
+
+	// Clean rclone output to avoid "ERROR :" patterns confusing the log parser
+	cleanOutput := cleanRcloneOutput(string(output))
+
+	msg := fmt.Sprintf("Cloud storage error: rclone %s check failed for %s", stage, target)
+	if cleanOutput != "" {
+		msg = fmt.Sprintf("%s - %s", msg, cleanOutput) // Use " - " instead of ":" to avoid log parser issues
+	}
 
 	return &remoteCheckError{
 		kind: kind,
-		msg:  fmt.Sprintf("%s: %s", msg, strings.TrimSpace(string(output))),
+		msg:  msg,
 		err:  err,
 	}
 }
@@ -529,8 +540,32 @@ func containsAny(text string, substrings ...string) bool {
 	return false
 }
 
+// cleanRcloneOutput removes timestamps and "ERROR :" prefixes from rclone output
+// to produce cleaner error messages for logging and email notifications.
+// Example: "2025/01/11 10:00:00 ERROR : remote:path: directory not found"
+// becomes: "directory not found"
+func cleanRcloneOutput(output string) string {
+	output = strings.TrimSpace(output)
+	if output == "" {
+		return ""
+	}
+
+	// Remove rclone timestamp and ERROR prefix pattern: "YYYY/MM/DD HH:MM:SS ERROR : path: "
+	if idx := strings.Index(output, "ERROR : "); idx != -1 {
+		output = output[idx+8:] // Skip "ERROR : "
+		// Skip the path part (until next ": ")
+		if idx2 := strings.Index(output, ": "); idx2 != -1 {
+			output = output[idx2+2:]
+		}
+	}
+
+	return strings.TrimSpace(output)
+}
+
 // Store uploads a backup file to cloud storage using rclone
-func (c *CloudStorage) Store(ctx context.Context, backupFile string, metadata *types.BackupMetadata) error {
+func (c *CloudStorage) Store(ctx context.Context, backupFile string, metadata *types.BackupMetadata) (err error) {
+	done := logging.DebugStart(c.logger, "cloud store", "file=%s", filepath.Base(backupFile))
+	defer func() { done(err) }()
 	c.logger.Debug("Cloud storage: preparing to upload %s", filepath.Base(backupFile))
 	// Check context
 	if err := ctx.Err(); err != nil {
@@ -555,6 +590,7 @@ func (c *CloudStorage) Store(ctx context.Context, backupFile string, metadata *t
 
 	filename := filepath.Base(backupFile)
 	remoteFile := c.remotePathFor(filename)
+	logging.DebugStep(c.logger, "cloud store", "source size=%s remote=%s", utils.FormatBytes(stat.Size()), c.remoteLabel())
 
 	c.logger.Info("Uploading backup to cloud storage: %s (%s) -> %s (timeout: %ds)",
 		filename,
@@ -604,6 +640,7 @@ func (c *CloudStorage) Store(ctx context.Context, backupFile string, metadata *t
 		}
 	}
 
+	logging.DebugStep(c.logger, "cloud store", "upload tasks=%d mode=%s", len(tasks), c.uploadMode)
 	primaryFailed, err := c.uploadTasks(uploadCtx, tasks)
 	if err != nil {
 		op := "upload_associated"
@@ -864,7 +901,9 @@ func (c *CloudStorage) rcloneCopy(ctx context.Context, localFile, remoteFile str
 
 // VerifyUpload verifies that a file was successfully uploaded to cloud storage
 // Uses two methods: primary (rclone lsl) and alternative (rclone ls + grep)
-func (c *CloudStorage) VerifyUpload(ctx context.Context, localFile, remoteFile string) (bool, error) {
+func (c *CloudStorage) VerifyUpload(ctx context.Context, localFile, remoteFile string) (ok bool, err error) {
+	done := logging.DebugStart(c.logger, "cloud verify upload", "file=%s", filepath.Base(localFile))
+	defer func() { done(err) }()
 	// Get local file info
 	localStat, err := os.Stat(localFile)
 	if err != nil {
@@ -872,6 +911,7 @@ func (c *CloudStorage) VerifyUpload(ctx context.Context, localFile, remoteFile s
 	}
 
 	filename := remoteBaseName(remoteFile)
+	logging.DebugStep(c.logger, "cloud verify upload", "method=%s expected=%s", c.config.RcloneVerifyMethod, utils.FormatBytes(localStat.Size()))
 
 	// Use primary verification method by default
 	if c.config.RcloneVerifyMethod != "alternative" {
@@ -979,7 +1019,9 @@ type lslEntry struct {
 }
 
 // List returns all backups in cloud storage
-func (c *CloudStorage) List(ctx context.Context) ([]*types.BackupMetadata, error) {
+func (c *CloudStorage) List(ctx context.Context) (backups []*types.BackupMetadata, err error) {
+	done := logging.DebugStart(c.logger, "cloud list", "remote=%s", c.remoteLabel())
+	defer func() { done(err) }()
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -988,6 +1030,7 @@ func (c *CloudStorage) List(ctx context.Context) ([]*types.BackupMetadata, error
 	args := c.buildRcloneArgs("lsl")
 	args = append(args, c.remoteBase())
 
+	logging.DebugStep(c.logger, "cloud list", "running rclone lsl")
 	output, err := c.exec(ctx, args[0], args[1:]...)
 
 	if err != nil {
@@ -1006,7 +1049,9 @@ func (c *CloudStorage) List(ctx context.Context) ([]*types.BackupMetadata, error
 	snapshot := buildSnapshot(entries)
 	c.setRemoteSnapshot(snapshot)
 
-	backups := c.buildBackupMetadata(entries, snapshot)
+	logging.DebugStep(c.logger, "cloud list", "entries=%d", len(entries))
+	backups = c.buildBackupMetadata(entries, snapshot)
+	logging.DebugStep(c.logger, "cloud list", "backups=%d", len(backups))
 
 	// Sort by timestamp (newest first)
 	sort.Slice(backups, func(i, j int) bool {
@@ -1142,7 +1187,9 @@ func (c *CloudStorage) Delete(ctx context.Context, backupFile string) error {
 	return err
 }
 
-func (c *CloudStorage) deleteBackupInternal(ctx context.Context, backupFile string) (bool, error) {
+func (c *CloudStorage) deleteBackupInternal(ctx context.Context, backupFile string) (logDeleted bool, err error) {
+	done := logging.DebugStart(c.logger, "cloud delete", "file=%s", backupFile)
+	defer func() { done(err) }()
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
@@ -1158,6 +1205,7 @@ func (c *CloudStorage) deleteBackupInternal(ctx context.Context, backupFile stri
 	c.logger.Debug("Deleting cloud backup: %s", backupFile)
 
 	candidateNames := buildBackupCandidatePaths(baseName, c.config.BundleAssociatedFiles)
+	logging.DebugStep(c.logger, "cloud delete", "candidates=%d", len(candidateNames))
 	relativeNames := make([]string, 0, len(candidateNames))
 	for _, name := range candidateNames {
 		name = strings.TrimSpace(name)
@@ -1202,7 +1250,7 @@ func (c *CloudStorage) deleteBackupInternal(ctx context.Context, backupFile stri
 	}
 
 	// Best-effort: delete associated cloud log file for this backup
-	logDeleted := c.deleteAssociatedLog(ctx, backupFile)
+	logDeleted = c.deleteAssociatedLog(ctx, backupFile)
 
 	if len(failedFiles) > 0 {
 		return logDeleted, fmt.Errorf("failed to delete %d file(s): %v", len(failedFiles), failedFiles)
@@ -1334,13 +1382,16 @@ func (c *CloudStorage) cloudLogPath(basePath, fileName string) string {
 // ApplyRetention removes old backups according to retention policy
 // Supports both simple (count-based) and GFS (time-distributed) policies
 // Uses batched deletion to avoid API rate limits
-func (c *CloudStorage) ApplyRetention(ctx context.Context, config RetentionConfig) (int, error) {
+func (c *CloudStorage) ApplyRetention(ctx context.Context, config RetentionConfig) (deleted int, err error) {
+	done := logging.DebugStart(c.logger, "cloud retention", "policy=%s max=%d", config.Policy, config.MaxBackups)
+	defer func() { done(err) }()
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
 
 	// List all backups
 	c.logger.Debug("Cloud storage: listing backups for retention policy '%s'", config.Policy)
+	logging.DebugStep(c.logger, "cloud retention", "listing backups")
 	backups, err := c.List(ctx)
 	if err != nil {
 		c.logger.Debug("WARNING: Cloud storage - failed to list backups for retention: %v", err)
@@ -1502,14 +1553,17 @@ func (c *CloudStorage) LastRetentionSummary() RetentionSummary {
 }
 
 // GetStats returns storage statistics
-func (c *CloudStorage) GetStats(ctx context.Context) (*StorageStats, error) {
+func (c *CloudStorage) GetStats(ctx context.Context) (stats *StorageStats, err error) {
+	done := logging.DebugStart(c.logger, "cloud stats", "remote=%s", c.remoteLabel())
+	defer func() { done(err) }()
+	logging.DebugStep(c.logger, "cloud stats", "listing backups")
 	backups, err := c.List(ctx)
 	if err != nil {
 		c.logger.Debug("WARNING: Cloud storage - failed to get stats: %v", err)
 		return nil, err
 	}
 
-	stats := &StorageStats{
+	stats = &StorageStats{
 		TotalBackups:   len(backups),
 		FilesystemType: FilesystemType("rclone-" + c.remote),
 	}
@@ -1533,6 +1587,7 @@ func (c *CloudStorage) GetStats(ctx context.Context) (*StorageStats, error) {
 	stats.TotalSize = totalSize
 	stats.OldestBackup = oldest
 	stats.NewestBackup = newest
+	logging.DebugStep(c.logger, "cloud stats", "backups=%d size=%s", stats.TotalBackups, utils.FormatBytes(stats.TotalSize))
 
 	return stats, nil
 }
