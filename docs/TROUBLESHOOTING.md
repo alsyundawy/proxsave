@@ -277,6 +277,28 @@ iptables -L -n | grep -i drop
 
 ---
 
+#### Restore/Decrypt: stuck on “Scanning backup path…” or timeout (cloud/rclone)
+
+**Cause**: The tool scans cloud backups by listing the remote (`rclone lsf`) and reading each backup manifest (`rclone cat`). On slow remotes or very large directories this can time out.
+
+**Solution**:
+```bash
+# Increase scan timeout
+nano configs/backup.env
+RCLONE_TIMEOUT_CONNECTION=120
+
+# Re-run restore with debug logs (restore log path is printed on start)
+./build/proxsave --restore --log-level debug
+```
+
+If it still fails, run the equivalent manual checks:
+```bash
+rclone lsf <remote:path>
+rclone cat <remote:path>/<backup>.bundle.tar | head
+```
+
+---
+
 #### Error: `operation timeout (300s exceeded)`
 
 **Cause**: Large backup file + slow upload speed.
@@ -298,6 +320,8 @@ COMPRESSION_MODE=fast
 BACKUP_CLUSTER_CONFIG=false
 BACKUP_ROOT_HOME=false
 ```
+
+> Note: `BACKUP_CLUSTER_CONFIG=false` also skips cluster runtime collection (`pvecm status`, `pvecm nodes`, HA status), which helps avoid non-critical cluster warnings on standalone nodes.
 
 ---
 
@@ -552,6 +576,23 @@ MIN_DISK_SPACE_PRIMARY_GB=5  # Lower threshold
 
 ---
 ### 7. Restore Issues
+
+#### Restore drops SSH / IP changes during network restore
+
+**Symptoms**:
+- SSH/Web UI disconnects during restore when the `network` category is applied live
+- You see a `NETWORK ROLLBACK` block in the footer (especially after Ctrl+C)
+
+**Explanation**:
+- Live network apply can change IP/routes immediately.
+- ProxSave protects access by arming a rollback timer that can revert network-related files automatically if `COMMIT` is not received in time.
+
+**What to do**:
+- Prefer running restore from the **local console/IPMI**, not over SSH.
+- If the footer says **ARMED**, reconnect using the **pre-apply IP** once rollback runs.
+- If it says **EXECUTED**, reconnect using the **pre-apply IP** (rollback already ran).
+- If it says **DISARMED/CLEARED**, reconnect using the **post-apply IP** (new config remains active).
+- Check the rollback log path printed in the footer for details.
 
 #### Error during network preflight: `addr_add_dry_run() got an unexpected keyword argument 'nodad'`
 

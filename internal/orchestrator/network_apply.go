@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -20,8 +21,12 @@ const defaultNetworkRollbackTimeout = 180 * time.Second
 var ErrNetworkApplyNotCommitted = errors.New("network configuration not committed")
 
 type NetworkApplyNotCommittedError struct {
-	RollbackLog string
-	RestoredIP  string
+	RollbackLog      string
+	RollbackMarker   string
+	RestoredIP       string
+	OriginalIP       string // IP from backup file (will be restored by rollback)
+	RollbackArmed    bool
+	RollbackDeadline time.Time // when rollback will execute
 }
 
 func (e *NetworkApplyNotCommittedError) Error() string {
@@ -115,11 +120,17 @@ func maybeApplyNetworkConfigCLI(ctx context.Context, reader *bufio.Reader, logge
 	}
 
 	logging.DebugStep(logger, "network safe apply (cli)", "Prompt: apply network now with rollback timer")
-	applyNowPrompt := fmt.Sprintf(
-		"Apply restored network configuration now with automatic rollback (%ds)? (y/N): ",
-		int(defaultNetworkRollbackTimeout.Seconds()),
-	)
-	applyNow, err := promptYesNo(ctx, reader, applyNowPrompt)
+	rollbackSeconds := int(defaultNetworkRollbackTimeout.Seconds())
+	fmt.Println()
+	fmt.Println("Network restore: a restored network configuration is ready to apply.")
+	if strings.TrimSpace(stageRoot) != "" {
+		fmt.Printf("Source: %s (will be copied to /etc and applied)\n", strings.TrimSpace(stageRoot))
+	}
+	fmt.Println("This will reload networking immediately (no reboot).")
+	fmt.Println("WARNING: This may change the active IP and disconnect SSH/Web sessions.")
+	fmt.Printf("After applying, type COMMIT within %ds or ProxSave will roll back automatically.\n", rollbackSeconds)
+	fmt.Println("Recommendation: run this step from the local console/IPMI, not over SSH.")
+	applyNow, err := promptYesNoWithCountdown(ctx, reader, logger, "Apply network configuration now?", 90*time.Second, false)
 	if err != nil {
 		return err
 	}
@@ -418,42 +429,166 @@ func applyNetworkWithRollbackCLI(ctx context.Context, reader *bufio.Reader, logg
 	logging.DebugStep(logger, "network safe apply (cli)", "Wait for COMMIT (rollback in %ds)", int(remaining.Seconds()))
 	committed, err := promptNetworkCommitWithCountdown(ctx, reader, logger, remaining)
 	if err != nil {
-		logger.Warning("Commit prompt error: %v", err)
+		logger.Warning("Commit input lost (%v); rollback remains ARMED and will proceed automatically.", err)
+		return buildNetworkApplyNotCommittedError(ctx, logger, iface, handle)
 	}
 	logging.DebugStep(logger, "network safe apply (cli)", "User commit result: committed=%v", committed)
 	if committed {
+		if rollbackAlreadyRunning(ctx, logger, handle) {
+			logger.Warning("Commit received too late: rollback already running. Network configuration NOT committed.")
+			return buildNetworkApplyNotCommittedError(ctx, logger, iface, handle)
+		}
 		disarmNetworkRollback(ctx, logger, handle)
 		logger.Info("Network configuration committed successfully.")
 		return nil
 	}
 
-	// Timer window expired: run rollback now so the restore summary can report the final state.
-	if output, rbErr := restoreCmd.Run(ctx, "sh", handle.scriptPath); rbErr != nil {
-		if len(output) > 0 {
-			logger.Debug("Rollback script output: %s", strings.TrimSpace(string(output)))
-		}
-		return fmt.Errorf("network apply not committed; rollback failed (log: %s): %w", strings.TrimSpace(handle.logPath), rbErr)
-	} else if len(output) > 0 {
-		logger.Debug("Rollback script output: %s", strings.TrimSpace(string(output)))
+	// Not committed: keep rollback ARMED. Do not disarm.
+	// The rollback script will run via systemd-run/nohup when the timer expires.
+	return buildNetworkApplyNotCommittedError(ctx, logger, iface, handle)
+}
+
+// extractIPFromSnapshot reads the IP address for a given interface from a network snapshot report file.
+// It searches the output section that follows the "$ ip -br addr" command written by writeNetworkSnapshot.
+func extractIPFromSnapshot(path, iface string) string {
+	if strings.TrimSpace(path) == "" || strings.TrimSpace(iface) == "" {
+		return "unknown"
 	}
-	disarmNetworkRollback(ctx, logger, handle)
+	data, err := restoreFS.ReadFile(path)
+	if err != nil {
+		return "unknown"
+	}
+
+	lines := strings.Split(string(data), "\n")
+	inAddrSection := false
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "$ ip -br addr" {
+			inAddrSection = true
+			continue
+		}
+		if strings.HasPrefix(line, "$ ") {
+			if inAddrSection {
+				break
+			}
+			continue
+		}
+		if !inAddrSection || line == "" || strings.HasPrefix(line, "ERROR:") {
+			continue
+		}
+
+		fields := strings.Fields(line)
+		if len(fields) < 3 || fields[0] != iface {
+			continue
+		}
+
+		// "ip -br addr" can print multiple addresses; prefer IPv4 when available.
+		firstIPv6 := ""
+		for _, token := range fields[2:] {
+			ip := strings.Split(token, "/")[0]
+			parsed := net.ParseIP(ip)
+			if parsed == nil {
+				continue
+			}
+			if parsed.To4() != nil {
+				return ip
+			}
+			if firstIPv6 == "" {
+				firstIPv6 = ip
+			}
+		}
+		if firstIPv6 != "" {
+			return firstIPv6
+		}
+		return "unknown"
+	}
+
+	return "unknown"
+}
+
+func buildNetworkApplyNotCommittedError(ctx context.Context, logger *logging.Logger, iface string, handle *networkRollbackHandle) *NetworkApplyNotCommittedError {
+	logging.DebugStep(logger, "build not-committed error", "Start: iface=%s handle=%v", iface, handle != nil)
 
 	restoredIP := "unknown"
 	if strings.TrimSpace(iface) != "" {
-		deadline := time.Now().Add(5 * time.Second)
-		for time.Now().Before(deadline) {
-			ep, err := currentNetworkEndpoint(ctx, iface, 1*time.Second)
-			if err == nil && len(ep.Addresses) > 0 {
-				restoredIP = strings.Join(ep.Addresses, ", ")
-				break
-			}
-			time.Sleep(300 * time.Millisecond)
+		logging.DebugStep(logger, "build not-committed error", "Querying current IP for iface=%s", iface)
+		if ep, err := currentNetworkEndpoint(ctx, iface, 1*time.Second); err == nil && len(ep.Addresses) > 0 {
+			restoredIP = strings.Join(ep.Addresses, ", ")
+			logging.DebugStep(logger, "build not-committed error", "Current IP: %s", restoredIP)
+		} else if err != nil {
+			logging.DebugStep(logger, "build not-committed error", "Failed to get IP: %v", err)
 		}
 	}
-	return &NetworkApplyNotCommittedError{
-		RollbackLog: strings.TrimSpace(handle.logPath),
-		RestoredIP:  strings.TrimSpace(restoredIP),
+
+	rollbackArmed := true
+	logging.DebugStep(logger, "build not-committed error", "Checking rollback marker status")
+	if handle == nil {
+		rollbackArmed = false
+		logging.DebugStep(logger, "build not-committed error", "No handle: rollbackArmed=false")
+	} else if strings.TrimSpace(handle.markerPath) != "" {
+		if _, statErr := restoreFS.Stat(handle.markerPath); statErr != nil {
+			// Marker missing => rollback likely already executed (or was manually removed).
+			rollbackArmed = false
+			logging.DebugStep(logger, "build not-committed error", "Marker missing (%s): rollbackArmed=false", handle.markerPath)
+		} else {
+			logging.DebugStep(logger, "build not-committed error", "Marker exists (%s): rollbackArmed=true", handle.markerPath)
+		}
 	}
+
+	rollbackLog := ""
+	rollbackMarker := ""
+	originalIP := "unknown"
+	var rollbackDeadline time.Time
+	if handle != nil {
+		rollbackLog = strings.TrimSpace(handle.logPath)
+		rollbackMarker = strings.TrimSpace(handle.markerPath)
+		// Read original IP from before.txt snapshot (IP that will be restored by rollback)
+		if strings.TrimSpace(handle.workDir) != "" {
+			beforePath := filepath.Join(handle.workDir, "before.txt")
+			originalIP = extractIPFromSnapshot(beforePath, iface)
+			logging.DebugStep(logger, "build not-committed error", "Original IP from %s: %s", beforePath, originalIP)
+		}
+		// Calculate rollback deadline
+		rollbackDeadline = handle.armedAt.Add(handle.timeout)
+		logging.DebugStep(logger, "build not-committed error", "Rollback deadline: %s", rollbackDeadline.Format(time.RFC3339))
+	}
+
+	logging.DebugStep(logger, "build not-committed error", "Result: ip=%s originalIP=%s armed=%v log=%s", restoredIP, originalIP, rollbackArmed, rollbackLog)
+	return &NetworkApplyNotCommittedError{
+		RollbackLog:      rollbackLog,
+		RollbackMarker:   rollbackMarker,
+		RestoredIP:       strings.TrimSpace(restoredIP),
+		OriginalIP:       originalIP,
+		RollbackArmed:    rollbackArmed,
+		RollbackDeadline: rollbackDeadline,
+	}
+}
+
+func rollbackAlreadyRunning(ctx context.Context, logger *logging.Logger, handle *networkRollbackHandle) bool {
+	if handle == nil || strings.TrimSpace(handle.unitName) == "" {
+		logging.DebugStep(logger, "rollback already running", "Skip check: handle=%v unitName=%q", handle != nil, "")
+		return false
+	}
+	if !commandAvailable("systemctl") {
+		logging.DebugStep(logger, "rollback already running", "Skip check: systemctl not available")
+		return false
+	}
+
+	serviceUnit := strings.TrimSpace(handle.unitName) + ".service"
+	logging.DebugStep(logger, "rollback already running", "Checking systemctl is-active %s", serviceUnit)
+
+	checkCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	out, err := restoreCmd.Run(checkCtx, "systemctl", "is-active", serviceUnit)
+	if err != nil {
+		logging.DebugStep(logger, "rollback already running", "systemctl is-active failed: %v (assuming not running)", err)
+		return false
+	}
+
+	state := strings.TrimSpace(string(out))
+	running := state == "active" || state == "activating"
+	logging.DebugStep(logger, "rollback already running", "Service state=%s running=%v", state, running)
+	return running
 }
 
 func armNetworkRollback(ctx context.Context, logger *logging.Logger, backupPath string, timeout time.Duration, workDir string) (handle *networkRollbackHandle, err error) {
@@ -466,6 +601,7 @@ func armNetworkRollback(ctx context.Context, logger *logging.Logger, backupPath 
 	if timeout <= 0 {
 		return nil, fmt.Errorf("invalid rollback timeout")
 	}
+	logging.DebugStep(logger, "arm network rollback", "Parameters validated: backup=%s timeout=%s", backupPath, timeout)
 
 	logging.DebugStep(logger, "arm network rollback", "Prepare rollback work directory")
 	baseDir := strings.TrimSpace(workDir)
@@ -487,17 +623,20 @@ func armNetworkRollback(ctx context.Context, logger *logging.Logger, backupPath 
 		armedAt:    time.Now(),
 		timeout:    timeout,
 	}
+	logging.DebugStep(logger, "arm network rollback", "Handle created: marker=%s script=%s log=%s", handle.markerPath, handle.scriptPath, handle.logPath)
 
 	logging.DebugStep(logger, "arm network rollback", "Write rollback marker: %s", handle.markerPath)
 	if err := restoreFS.WriteFile(handle.markerPath, []byte("pending\n"), 0o640); err != nil {
 		return nil, fmt.Errorf("write rollback marker: %w", err)
 	}
+	logging.DebugStep(logger, "arm network rollback", "Marker written successfully")
 
 	logging.DebugStep(logger, "arm network rollback", "Write rollback script: %s", handle.scriptPath)
 	script := buildRollbackScript(handle.markerPath, backupPath, handle.logPath, true)
 	if err := restoreFS.WriteFile(handle.scriptPath, []byte(script), 0o640); err != nil {
 		return nil, fmt.Errorf("write rollback script: %w", err)
 	}
+	logging.DebugStep(logger, "arm network rollback", "Script written successfully (%d bytes)", len(script))
 
 	timeoutSeconds := int(timeout.Seconds())
 	if timeoutSeconds < 1 {
@@ -517,8 +656,11 @@ func armNetworkRollback(ctx context.Context, logger *logging.Logger, backupPath 
 			logger.Warning("systemd-run failed, falling back to background timer: %v", err)
 			logger.Debug("systemd-run output: %s", strings.TrimSpace(string(output)))
 			handle.unitName = ""
-		} else if len(output) > 0 {
-			logger.Debug("systemd-run output: %s", strings.TrimSpace(string(output)))
+		} else {
+			logging.DebugStep(logger, "arm network rollback", "Timer armed via systemd-run: unit=%s", handle.unitName)
+			if len(output) > 0 {
+				logger.Debug("systemd-run output: %s", strings.TrimSpace(string(output)))
+			}
 		}
 	}
 
@@ -529,6 +671,7 @@ func armNetworkRollback(ctx context.Context, logger *logging.Logger, backupPath 
 			logger.Debug("Background rollback output: %s", strings.TrimSpace(string(output)))
 			return nil, fmt.Errorf("failed to arm rollback timer: %w", err)
 		}
+		logging.DebugStep(logger, "arm network rollback", "Timer armed via nohup (fallback)")
 	}
 
 	logger.Info("Rollback timer armed (%ds). Work dir: %s (log: %s)", timeoutSeconds, baseDir, handle.logPath)
@@ -537,19 +680,37 @@ func armNetworkRollback(ctx context.Context, logger *logging.Logger, backupPath 
 
 func disarmNetworkRollback(ctx context.Context, logger *logging.Logger, handle *networkRollbackHandle) {
 	if handle == nil {
+		logging.DebugStep(logger, "disarm network rollback", "Skip: handle is nil")
 		return
 	}
-	logging.DebugStep(logger, "disarm network rollback", "Disarming rollback (marker=%s unit=%s)", strings.TrimSpace(handle.markerPath), strings.TrimSpace(handle.unitName))
-	if handle.markerPath != "" {
+
+	logging.DebugStep(logger, "disarm network rollback", "Start: marker=%s unit=%s", strings.TrimSpace(handle.markerPath), strings.TrimSpace(handle.unitName))
+
+	// Remove marker first so that even if the timer triggers concurrently the rollback script exits early.
+	if strings.TrimSpace(handle.markerPath) != "" {
+		logging.DebugStep(logger, "disarm network rollback", "Removing marker file: %s", handle.markerPath)
 		if err := restoreFS.Remove(handle.markerPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-			logger.Debug("Failed to remove rollback marker %s: %v", handle.markerPath, err)
+			logger.Warning("Failed to remove rollback marker %s: %v", handle.markerPath, err)
+		} else {
+			logging.DebugStep(logger, "disarm network rollback", "Marker removed successfully")
 		}
 	}
-	if handle.unitName != "" && commandAvailable("systemctl") {
-		if output, err := restoreCmd.Run(ctx, "systemctl", "stop", handle.unitName); err != nil {
-			logger.Debug("Failed to stop rollback unit %s: %v (output: %s)", handle.unitName, err, strings.TrimSpace(string(output)))
+
+	if strings.TrimSpace(handle.unitName) != "" && commandAvailable("systemctl") {
+		// Stop the timer only. If the service already started, let it finish.
+		timerUnit := strings.TrimSpace(handle.unitName) + ".timer"
+		logging.DebugStep(logger, "disarm network rollback", "Stopping timer: %s", timerUnit)
+		if output, err := restoreCmd.Run(ctx, "systemctl", "stop", timerUnit); err != nil {
+			logger.Warning("Failed to stop rollback timer %s: %v (output: %s)", timerUnit, err, strings.TrimSpace(string(output)))
+		} else {
+			logging.DebugStep(logger, "disarm network rollback", "Timer stopped successfully")
 		}
+
+		logging.DebugStep(logger, "disarm network rollback", "Resetting failed units")
+		_, _ = restoreCmd.Run(ctx, "systemctl", "reset-failed", strings.TrimSpace(handle.unitName)+".service", timerUnit)
 	}
+
+	logging.DebugStep(logger, "disarm network rollback", "Disarm complete")
 }
 
 func maybeRepairNICNamesCLI(ctx context.Context, reader *bufio.Reader, logger *logging.Logger, archivePath string) *nicRepairResult {
@@ -739,18 +900,24 @@ func defaultNetworkPortChecks(systemType SystemType) []tcpPortCheck {
 }
 
 func promptNetworkCommitWithCountdown(ctx context.Context, reader *bufio.Reader, logger *logging.Logger, remaining time.Duration) (bool, error) {
+	logging.DebugStep(logger, "prompt commit", "Start: remaining=%s", remaining)
+
 	if remaining <= 0 {
+		logging.DebugStep(logger, "prompt commit", "No time remaining, returning timeout")
 		return false, context.DeadlineExceeded
 	}
 
-	fmt.Printf("Type COMMIT within %d seconds to keep the new network configuration.\n", int(remaining.Seconds()))
 	deadline := time.Now().Add(remaining)
+	logging.DebugStep(logger, "prompt commit", "Deadline set: %s", deadline.Format(time.RFC3339))
+
+	fmt.Printf("Type COMMIT within %d seconds to keep the new network configuration.\n", int(remaining.Seconds()))
 	ctxTimeout, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
 
 	inputCh := make(chan string, 1)
 	errCh := make(chan error, 1)
 
+	logging.DebugStep(logger, "prompt commit", "Starting input reader goroutine")
 	go func() {
 		line, err := input.ReadLineWithContext(ctxTimeout, reader)
 		if err != nil {
@@ -763,6 +930,8 @@ func promptNetworkCommitWithCountdown(ctx context.Context, reader *bufio.Reader,
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
+	logging.DebugStep(logger, "prompt commit", "Waiting for user input...")
+
 	for {
 		select {
 		case <-ticker.C:
@@ -773,20 +942,27 @@ func promptNetworkCommitWithCountdown(ctx context.Context, reader *bufio.Reader,
 			fmt.Fprintf(os.Stderr, "\rRollback in %ds... Type COMMIT to keep: ", int(left.Seconds()))
 			if left <= 0 {
 				fmt.Fprintln(os.Stderr)
+				logging.DebugStep(logger, "prompt commit", "Timeout expired, returning DeadlineExceeded")
 				return false, context.DeadlineExceeded
 			}
 		case line := <-inputCh:
 			fmt.Fprintln(os.Stderr)
-			if strings.EqualFold(strings.TrimSpace(line), "commit") {
+			trimmedLine := strings.TrimSpace(line)
+			logging.DebugStep(logger, "prompt commit", "User input received: %q", trimmedLine)
+			if strings.EqualFold(trimmedLine, "commit") {
+				logging.DebugStep(logger, "prompt commit", "Result: COMMITTED")
 				return true, nil
 			}
+			logging.DebugStep(logger, "prompt commit", "Result: NOT COMMITTED (input was not 'commit')")
 			return false, nil
 		case err := <-errCh:
 			fmt.Fprintln(os.Stderr)
+			logging.DebugStep(logger, "prompt commit", "Input error received: %v", err)
 			if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+				logging.DebugStep(logger, "prompt commit", "Result: context deadline/canceled")
 				return false, err
 			}
-			logger.Debug("Commit input error: %v", err)
+			logging.DebugStep(logger, "prompt commit", "Result: NOT COMMITTED (input error)")
 			return false, err
 		}
 	}
@@ -851,41 +1027,70 @@ func buildRollbackScript(markerPath, backupPath, logPath string, restartNetworki
 		fmt.Sprintf("LOG=%s", shellQuote(logPath)),
 		fmt.Sprintf("MARKER=%s", shellQuote(markerPath)),
 		fmt.Sprintf("BACKUP=%s", shellQuote(backupPath)),
-		`if [ ! -f "$MARKER" ]; then exit 0; fi`,
-		`echo "Rollback started at $(date -Is)" >> "$LOG"`,
-		`echo "Rollback backup: $BACKUP" >> "$LOG"`,
-		`echo "Extract phase: restore files from rollback archive" >> "$LOG"`,
+		// Header
+		`echo "[INFO] ========================================" >> "$LOG"`,
+		`echo "[INFO] NETWORK ROLLBACK SCRIPT STARTED" >> "$LOG"`,
+		`echo "[INFO] Timestamp: $(date -Is)" >> "$LOG"`,
+		`echo "[INFO] Marker: $MARKER" >> "$LOG"`,
+		`echo "[INFO] Backup: $BACKUP" >> "$LOG"`,
+		`echo "[INFO] ========================================" >> "$LOG"`,
+		// Check marker
+		`echo "[DEBUG] Checking marker file..." >> "$LOG"`,
+		`if [ ! -f "$MARKER" ]; then`,
+		`  echo "[INFO] Marker not found - rollback cancelled (already disarmed)" >> "$LOG"`,
+		`  echo "[INFO] ========================================" >> "$LOG"`,
+		`  echo "[INFO] ROLLBACK SCRIPT EXITED (no-op)" >> "$LOG"`,
+		`  echo "[INFO] ========================================" >> "$LOG"`,
+		`  exit 0`,
+		`fi`,
+		`echo "[DEBUG] Marker exists, proceeding with rollback" >> "$LOG"`,
+		// Extract phase
+		`echo "[INFO] --- EXTRACT PHASE ---" >> "$LOG"`,
+		`echo "[DEBUG] Executing: tar -xzf $BACKUP -C /" >> "$LOG"`,
 		`TAR_OK=0`,
-		`if tar -xzf "$BACKUP" -C / >> "$LOG" 2>&1; then TAR_OK=1; echo "Extract phase: OK" >> "$LOG"; else echo "WARN: failed to extract rollback archive; skipping prune phase" >> "$LOG"; fi`,
+		`if tar -xzf "$BACKUP" -C / >> "$LOG" 2>&1; then`,
+		`  TAR_OK=1`,
+		`  echo "[OK] Extract phase completed successfully" >> "$LOG"`,
+		`else`,
+		`  RC=$?`,
+		`  echo "[ERROR] Extract phase failed (exit=$RC) - skipping prune phase" >> "$LOG"`,
+		`fi`,
+		// Prune phase
 		`if [ "$TAR_OK" -eq 1 ] && [ -d /etc/network ]; then`,
-		`  echo "Prune phase: removing files created after backup (network-only)" >> "$LOG"`,
-		`  echo "Prune scope: /etc/network (+ /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg, /etc/dnsmasq.d/lxc-vmbr1.conf)" >> "$LOG"`,
+		`  echo "[INFO] --- PRUNE PHASE ---" >> "$LOG"`,
+		`  echo "[DEBUG] Scope: /etc/network (+ /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg, /etc/dnsmasq.d/lxc-vmbr1.conf)" >> "$LOG"`,
 		`  (`,
 		`    set +e`,
+		`    echo "[DEBUG] Creating temp files for prune operation..."`,
 		`    MANIFEST_ALL=$(mktemp /tmp/proxsave/network_rollback_manifest_all_XXXXXX 2>/dev/null)`,
 		`    MANIFEST=$(mktemp /tmp/proxsave/network_rollback_manifest_XXXXXX 2>/dev/null)`,
 		`    CANDIDATES=$(mktemp /tmp/proxsave/network_rollback_candidates_XXXXXX 2>/dev/null)`,
 		`    CLEANUP=$(mktemp /tmp/proxsave/network_rollback_cleanup_XXXXXX 2>/dev/null)`,
 		`    if [ -z "$MANIFEST_ALL" ] || [ -z "$MANIFEST" ] || [ -z "$CANDIDATES" ] || [ -z "$CLEANUP" ]; then`,
-		`      echo "WARN: mktemp failed; skipping prune"`,
+		`      echo "[WARN] mktemp failed - skipping prune phase"`,
 		`      exit 0`,
 		`    fi`,
-		`    echo "Listing rollback archive contents..."`,
+		`    echo "[DEBUG] Temp files created: manifest_all=$MANIFEST_ALL manifest=$MANIFEST candidates=$CANDIDATES cleanup=$CLEANUP"`,
+		`    echo "[DEBUG] Listing rollback archive contents..."`,
 		`    if ! tar -tzf "$BACKUP" > "$MANIFEST_ALL"; then`,
-		`      echo "WARN: failed to list rollback archive; skipping prune"`,
+		`      echo "[WARN] Failed to list rollback archive - skipping prune phase"`,
 		`      rm -f "$MANIFEST_ALL" "$MANIFEST" "$CANDIDATES" "$CLEANUP"`,
 		`      exit 0`,
 		`    fi`,
-		`    echo "Normalizing manifest paths..."`,
+		`    MANIFEST_COUNT=$(wc -l < "$MANIFEST_ALL")`,
+		`    echo "[DEBUG] Archive contains $MANIFEST_COUNT entries"`,
+		`    echo "[DEBUG] Normalizing manifest paths..."`,
 		`    sed 's#^\./##' "$MANIFEST_ALL" > "$MANIFEST"`,
 		`    if ! grep -q '^etc/network/' "$MANIFEST"; then`,
-		`      echo "WARN: rollback archive does not include etc/network; skipping prune"`,
+		`      echo "[WARN] Rollback archive does not include etc/network - skipping prune phase"`,
 		`      rm -f "$MANIFEST_ALL" "$MANIFEST" "$CANDIDATES" "$CLEANUP"`,
 		`      exit 0`,
 		`    fi`,
-		`    echo "Scanning current filesystem under /etc/network..."`,
+		`    echo "[DEBUG] Scanning current filesystem under /etc/network..."`,
 		`    find /etc/network -mindepth 1 \( -type f -o -type l \) -print > "$CANDIDATES" 2>/dev/null || true`,
-		`    echo "Computing cleanup list (present on disk, absent in backup)..."`,
+		`    CANDIDATES_COUNT=$(wc -l < "$CANDIDATES")`,
+		`    echo "[DEBUG] Found $CANDIDATES_COUNT files/links on disk"`,
+		`    echo "[DEBUG] Computing cleanup list (present on disk, absent in backup)..."`,
 		`    : > "$CLEANUP"`,
 		`    while IFS= read -r path; do`,
 		`      rel=${path#/}`,
@@ -902,15 +1107,22 @@ func buildRollbackScript(markerPath, backupPath, logPath string, restartNetworki
 		`      fi`,
 		`    done`,
 		`    if [ -s "$CLEANUP" ]; then`,
-		`      echo "Pruning extraneous network files (not present in backup):"`,
+		`      CLEANUP_COUNT=$(wc -l < "$CLEANUP")`,
+		`      echo "[DEBUG] Found $CLEANUP_COUNT extraneous files to prune:"`,
 		`      cat "$CLEANUP"`,
+		`      echo "[DEBUG] Removing extraneous files..."`,
+		`      REMOVED=0`,
 		`      while IFS= read -r rmPath; do`,
-		`        rm -f -- "$rmPath" || true`,
+		`        if rm -f -- "$rmPath"; then`,
+		`          REMOVED=$((REMOVED+1))`,
+		`        else`,
+		`          echo "[WARN] Failed to remove: $rmPath"`,
+		`        fi`,
 		`      done < "$CLEANUP"`,
+		`      echo "[OK] Prune phase completed - removed $REMOVED files"`,
 		`    else`,
-		`      echo "No extraneous network files to prune."`,
+		`      echo "[OK] Prune phase completed - no extraneous files to remove"`,
 		`    fi`,
-		`    echo "Prune phase: done"`,
 		`    rm -f "$MANIFEST_ALL" "$MANIFEST" "$CANDIDATES" "$CLEANUP"`,
 		`  ) >> "$LOG" 2>&1 || true`,
 		`fi`,
@@ -918,19 +1130,59 @@ func buildRollbackScript(markerPath, backupPath, logPath string, restartNetworki
 
 	if restartNetworking {
 		lines = append(lines,
-			`echo "Restart networking after rollback" >> "$LOG"`,
-			`if command -v ifreload >/dev/null 2>&1; then ifreload -a >> "$LOG" 2>&1 || true;`,
-			`elif command -v systemctl >/dev/null 2>&1; then systemctl restart networking >> "$LOG" 2>&1 || true;`,
-			`elif command -v ifup >/dev/null 2>&1; then ifup -a >> "$LOG" 2>&1 || true;`,
+			`echo "[INFO] Restart networking after rollback" >> "$LOG"`,
+			`echo "[INFO] Live state before reload:" >> "$LOG"`,
+			`ip -br addr >> "$LOG" 2>&1 || true`,
+			`ip route show >> "$LOG" 2>&1 || true`,
+			`RELOAD_OK=0`,
+			`if command -v ifreload >/dev/null 2>&1; then`,
+			`  echo "[INFO] Executing: ifreload -a" >> "$LOG"`,
+			`  if ifreload -a >> "$LOG" 2>&1; then`,
+			`    RELOAD_OK=1`,
+			`    echo "[OK] ifreload -a completed successfully" >> "$LOG"`,
+			`  else`,
+			`    RC=$?`,
+			`    echo "[ERROR] ifreload -a failed (exit=$RC)" >> "$LOG"`,
+			`  fi`,
 			`fi`,
+			`if [ "$RELOAD_OK" -eq 0 ] && command -v systemctl >/dev/null 2>&1; then`,
+			`  echo "[INFO] Executing fallback: systemctl restart networking" >> "$LOG"`,
+			`  if systemctl restart networking >> "$LOG" 2>&1; then`,
+			`    RELOAD_OK=1`,
+			`    echo "[OK] systemctl restart networking completed successfully" >> "$LOG"`,
+			`  else`,
+			`    RC=$?`,
+			`    echo "[ERROR] systemctl restart networking failed (exit=$RC)" >> "$LOG"`,
+			`  fi`,
+			`fi`,
+			`if [ "$RELOAD_OK" -eq 0 ] && command -v ifup >/dev/null 2>&1; then`,
+			`  echo "[INFO] Executing fallback: ifup -a" >> "$LOG"`,
+			`  if ifup -a >> "$LOG" 2>&1; then`,
+			`    RELOAD_OK=1`,
+			`    echo "[OK] ifup -a completed successfully" >> "$LOG"`,
+			`  else`,
+			`    RC=$?`,
+			`    echo "[ERROR] ifup -a failed (exit=$RC)" >> "$LOG"`,
+			`  fi`,
+			`fi`,
+			`if [ "$RELOAD_OK" -eq 0 ]; then`,
+			`  echo "[WARN] All network reload methods failed - network may not be properly configured" >> "$LOG"`,
+			`fi`,
+			`echo "[INFO] Live state after reload:" >> "$LOG"`,
+			`ip -br addr >> "$LOG" 2>&1 || true`,
+			`ip route show >> "$LOG" 2>&1 || true`,
 		)
 	} else {
-		lines = append(lines, `echo "Restart networking after rollback: skipped (manual)" >> "$LOG"`)
+		lines = append(lines, `echo "[INFO] Restart networking after rollback: skipped (manual)" >> "$LOG"`)
 	}
 
 	lines = append(lines,
+		`echo "[DEBUG] Removing marker file..." >> "$LOG"`,
 		`rm -f "$MARKER"`,
-		`echo "Rollback finished at $(date -Is)" >> "$LOG"`,
+		`echo "[INFO] ========================================" >> "$LOG"`,
+		`echo "[INFO] NETWORK ROLLBACK SCRIPT FINISHED" >> "$LOG"`,
+		`echo "[INFO] Timestamp: $(date -Is)" >> "$LOG"`,
+		`echo "[INFO] ========================================" >> "$LOG"`,
 	)
 	return strings.Join(lines, "\n") + "\n"
 }

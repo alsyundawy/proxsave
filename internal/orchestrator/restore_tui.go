@@ -9,12 +9,14 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
 
 	"github.com/tis24dev/proxsave/internal/config"
+	"github.com/tis24dev/proxsave/internal/input"
 	"github.com/tis24dev/proxsave/internal/logging"
 	"github.com/tis24dev/proxsave/internal/tui"
 	"github.com/tis24dev/proxsave/internal/tui/components"
@@ -243,7 +245,9 @@ func RunRestoreWorkflowTUI(ctx context.Context, cfg *config.Config, logger *logg
 		}
 		clusterServicesStopped = true
 		defer func() {
-			if err := startPVEClusterServices(ctx, logger); err != nil {
+			restartCtx, cancel := context.WithTimeout(context.Background(), 2*serviceStartTimeout+2*serviceVerifyTimeout+10*time.Second)
+			defer cancel()
+			if err := startPVEClusterServices(restartCtx, logger); err != nil {
 				logger.Warning("Failed to restart PVE services after restore: %v", err)
 			}
 		}()
@@ -270,7 +274,9 @@ func RunRestoreWorkflowTUI(ctx context.Context, cfg *config.Config, logger *logg
 		} else {
 			pbsServicesStopped = true
 			defer func() {
-				if err := startPBSServices(ctx, logger); err != nil {
+				restartCtx, cancel := context.WithTimeout(context.Background(), 2*serviceStartTimeout+2*serviceVerifyTimeout+10*time.Second)
+				defer cancel()
+				if err := startPBSServices(restartCtx, logger); err != nil {
 					logger.Warning("Failed to restart PBS services after restore: %v", err)
 				}
 			}()
@@ -353,6 +359,9 @@ func RunRestoreWorkflowTUI(ctx context.Context, cfg *config.Config, logger *logg
 		}
 
 		if exportLog, exErr := extractSelectiveArchive(ctx, prepared.ArchivePath, exportRoot, plan.ExportCategories, RestoreModeCustom, logger); exErr != nil {
+			if errors.Is(exErr, ErrRestoreAborted) || input.IsAborted(exErr) {
+				return exErr
+			}
 			logger.Warning("Export completed with errors: %v", exErr)
 		} else {
 			exportLogPath = exportLog
@@ -365,6 +374,9 @@ func RunRestoreWorkflowTUI(ctx context.Context, cfg *config.Config, logger *logg
 			logger.Warning("Cluster SAFE mode selected but export directory not available; skipping automatic pvesh apply")
 		} else if err := runSafeClusterApply(ctx, bufio.NewReader(os.Stdin), exportRoot, logger); err != nil {
 			// Note: runSafeClusterApply currently uses console prompts; this step remains non-TUI.
+			if errors.Is(err, ErrRestoreAborted) || input.IsAborted(err) {
+				return err
+			}
 			logger.Warning("Cluster SAFE apply completed with errors: %v", err)
 		}
 	}
@@ -381,6 +393,9 @@ func RunRestoreWorkflowTUI(ctx context.Context, cfg *config.Config, logger *logg
 		}
 
 		if stageLog, err := extractSelectiveArchive(ctx, prepared.ArchivePath, stageRoot, plan.StagedCategories, RestoreModeCustom, logger); err != nil {
+			if errors.Is(err, ErrRestoreAborted) || input.IsAborted(err) {
+				return err
+			}
 			logger.Warning("Staging completed with errors: %v", err)
 		} else {
 			stageLogPath = stageLog
@@ -388,12 +403,18 @@ func RunRestoreWorkflowTUI(ctx context.Context, cfg *config.Config, logger *logg
 
 		logger.Info("")
 		if err := maybeApplyPBSConfigsFromStage(ctx, logger, plan, stageRoot, cfg.DryRun); err != nil {
+			if errors.Is(err, ErrRestoreAborted) || input.IsAborted(err) {
+				return err
+			}
 			logger.Warning("PBS staged config apply: %v", err)
 		}
 	}
 
 	stageRootForNetworkApply := stageRoot
 	if installed, err := maybeInstallNetworkConfigFromStage(ctx, logger, plan, stageRoot, prepared.ArchivePath, networkRollbackBackup, cfg.DryRun); err != nil {
+		if errors.Is(err, ErrRestoreAborted) || input.IsAborted(err) {
+			return err
+		}
 		logger.Warning("Network staged install: %v", err)
 	} else if installed {
 		stageRootForNetworkApply = ""
@@ -417,12 +438,18 @@ func RunRestoreWorkflowTUI(ctx context.Context, cfg *config.Config, logger *logg
 	if plan.HasCategoryID("network") {
 		logger.Info("")
 		if err := maybeRepairResolvConfAfterRestore(ctx, logger, prepared.ArchivePath, cfg.DryRun); err != nil {
+			if errors.Is(err, ErrRestoreAborted) || input.IsAborted(err) {
+				return err
+			}
 			logger.Warning("DNS resolver repair: %v", err)
 		}
 	}
 
 	logger.Info("")
 	if err := maybeApplyNetworkConfigTUI(ctx, logger, plan, safetyBackup, networkRollbackBackup, stageRootForNetworkApply, prepared.ArchivePath, configPath, buildSig, cfg.DryRun); err != nil {
+		if errors.Is(err, ErrRestoreAborted) || input.IsAborted(err) {
+			return err
+		}
 		logger.Warning("Network apply step skipped or failed: %v", err)
 	}
 
@@ -519,6 +546,7 @@ func runRestoreSelectionWizard(ctx context.Context, cfg *config.Config, logger *
 	selection := &restoreSelection{}
 	var selectionErr error
 	var scan scanController
+	var scanSeq uint64
 
 	pathList := tview.NewList().ShowSecondaryText(false)
 	pathList.SetMainTextColor(tcell.ColorWhite).
@@ -536,6 +564,7 @@ func runRestoreSelectionWizard(ctx context.Context, cfg *config.Config, logger *
 			return
 		}
 		selectedOption := options[index]
+		scanID := atomic.AddUint64(&scanSeq, 1)
 		logging.DebugStep(logger, "restore selection wizard", "selected source label=%q path=%q rclone=%v", selectedOption.Label, selectedOption.Path, selectedOption.IsRclone)
 		pages.SwitchToPage("paths-loading")
 		go func() {
@@ -544,11 +573,18 @@ func runRestoreSelectionWizard(ctx context.Context, cfg *config.Config, logger *
 
 			var candidates []*decryptCandidate
 			var scanErr error
-			scanDone := logging.DebugStart(logger, "scan backup source", "path=%s rclone=%v", selectedOption.Path, selectedOption.IsRclone)
+			scanDone := logging.DebugStart(logger, "scan backup source", "id=%d path=%s rclone=%v", scanID, selectedOption.Path, selectedOption.IsRclone)
 			defer func() { scanDone(scanErr) }()
 
 			if selectedOption.IsRclone {
-				candidates, scanErr = discoverRcloneBackups(scanCtx, selectedOption.Path, logger)
+				timeout := 30 * time.Second
+				if cfg != nil && cfg.RcloneTimeoutConnection > 0 {
+					timeout = time.Duration(cfg.RcloneTimeoutConnection) * time.Second
+				}
+				logging.DebugStep(logger, "scan backup source", "id=%d rclone_timeout=%s", scanID, timeout)
+				rcloneCtx, cancel := context.WithTimeout(scanCtx, timeout)
+				defer cancel()
+				candidates, scanErr = discoverRcloneBackups(rcloneCtx, selectedOption.Path, logger)
 			} else {
 				candidates, scanErr = discoverBackupCandidates(logger, selectedOption.Path)
 			}
@@ -560,6 +596,9 @@ func runRestoreSelectionWizard(ctx context.Context, cfg *config.Config, logger *
 			app.QueueUpdateDraw(func() {
 				if scanErr != nil {
 					message := fmt.Sprintf("Failed to inspect %s: %v", selectedOption.Path, scanErr)
+					if selectedOption.IsRclone && errors.Is(scanErr, context.DeadlineExceeded) {
+						message = fmt.Sprintf("Timed out while scanning %s (rclone). Check connectivity/rclone config or increase RCLONE_TIMEOUT_CONNECTION. (%v)", selectedOption.Path, scanErr)
+					}
 					showRestoreErrorModal(app, pages, configPath, buildSig, message, func() {
 						pages.SwitchToPage("paths")
 					})
@@ -1120,17 +1159,25 @@ func maybeApplyNetworkConfigTUI(ctx context.Context, logger *logging.Logger, pla
 	}
 
 	logging.DebugStep(logger, "network safe apply (tui)", "Prompt: apply network now with rollback timer")
+	sourceLine := "Source: /etc/network (will be applied)"
+	if strings.TrimSpace(stageRoot) != "" {
+		sourceLine = fmt.Sprintf("Source: %s (will be copied to /etc and applied)", strings.TrimSpace(stageRoot))
+	}
 	message := fmt.Sprintf(
-		"Apply restored network configuration now with an automatic rollback timer (%ds).\n\nIf you do not commit the changes, the previous network configuration will be restored automatically.\n\nProceed with live network apply?",
+		"Network restore: a restored network configuration is ready to apply.\n%s\n\nThis will reload networking immediately (no reboot).\n\nWARNING: This may change the active IP and disconnect SSH/Web sessions.\n\nAfter applying, type COMMIT within %ds or ProxSave will roll back automatically.\n\nRecommendation: run this step from the local console/IPMI, not over SSH.\n\nApply network configuration now?",
+		sourceLine,
 		int(defaultNetworkRollbackTimeout.Seconds()),
 	)
-	applyNow, err := promptYesNoTUIFunc(
+	applyNow, err := promptYesNoTUIWithCountdown(
+		ctx,
+		logger,
 		"Apply network configuration",
 		configPath,
 		buildSig,
 		message,
 		"Apply now",
 		"Skip apply",
+		90*time.Second,
 	)
 	if err != nil {
 		return err
@@ -1896,26 +1943,26 @@ func runFullRestoreTUI(ctx context.Context, candidate *decryptCandidate, prepare
 						logger.Info("No new safe mounts found to restore. Keeping current fstab.")
 					} else {
 						var msg strings.Builder
-						msg.WriteString("ProxSave ha trovato mount mancanti in /etc/fstab.\n\n")
+						msg.WriteString("ProxSave found missing mounts in /etc/fstab.\n\n")
 						if analysis.RootComparable && !analysis.RootMatch {
-							msg.WriteString("⚠ Root UUID mismatch: il backup sembra provenire da una macchina diversa.\n")
+							msg.WriteString("⚠ Root UUID mismatch: the backup appears to come from a different machine.\n")
 						}
 						if analysis.SwapComparable && !analysis.SwapMatch {
-							msg.WriteString("⚠ Swap mismatch: verrà mantenuta la configurazione swap attuale.\n")
+							msg.WriteString("⚠ Swap mismatch: the current swap configuration will be kept.\n")
 						}
-						msg.WriteString("\nMount proposti (sicuri):\n")
+						msg.WriteString("\nProposed mounts (safe):\n")
 						for _, m := range analysis.ProposedMounts {
 							fmt.Fprintf(&msg, "  - %s -> %s (%s)\n", m.Device, m.MountPoint, m.Type)
 						}
 						if len(analysis.SkippedMounts) > 0 {
-							msg.WriteString("\nMount trovati ma non proposti automaticamente:\n")
+							msg.WriteString("\nMounts found but not auto-proposed:\n")
 							for _, m := range analysis.SkippedMounts {
 								fmt.Fprintf(&msg, "  - %s -> %s (%s)\n", m.Device, m.MountPoint, m.Type)
 							}
-							msg.WriteString("\nSuggerimento: verifica dischi/UUID e opzioni (nofail/_netdev) prima di aggiungerli.\n")
+							msg.WriteString("\nHint: verify disks/UUIDs and options (nofail/_netdev) before adding them.\n")
 						}
 
-						apply, perr := promptYesNoTUIFunc("Smart fstab merge", configPath, buildSig, msg.String(), "Apply", "Skip")
+						apply, perr := promptYesNoTUIWithCountdown(ctx, logger, "Smart fstab merge", configPath, buildSig, msg.String(), "Apply", "Skip", 90*time.Second)
 						if perr != nil {
 							return perr
 						}
@@ -1969,6 +2016,96 @@ func promptYesNoTUI(title, configPath, buildSig, message, yesLabel, noLabel stri
 
 	if err := app.SetRoot(page, true).SetFocus(form.Form).Run(); err != nil {
 		return false, err
+	}
+	if cancelled {
+		return false, nil
+	}
+	return result, nil
+}
+
+func promptYesNoTUIWithCountdown(ctx context.Context, logger *logging.Logger, title, configPath, buildSig, message, yesLabel, noLabel string, timeout time.Duration) (bool, error) {
+	app := newTUIApp()
+	var result bool
+	var cancelled bool
+	var timedOut bool
+
+	infoText := tview.NewTextView().
+		SetText(message).
+		SetWrap(true).
+		SetTextColor(tcell.ColorWhite).
+		SetDynamicColors(true)
+
+	countdownText := tview.NewTextView().
+		SetWrap(false).
+		SetTextColor(tcell.ColorYellow).
+		SetDynamicColors(true)
+
+	deadline := time.Now().Add(timeout)
+	updateCountdown := func() {
+		left := time.Until(deadline)
+		if left < 0 {
+			left = 0
+		}
+		countdownText.SetText(fmt.Sprintf("Auto-skip in %ds (default: %s)", int(left.Seconds()), noLabel))
+	}
+	updateCountdown()
+
+	form := components.NewForm(app)
+	form.SetOnSubmit(func(values map[string]string) error {
+		result = true
+		return nil
+	})
+	form.SetOnCancel(func() {
+		cancelled = true
+	})
+	form.AddSubmitButton(yesLabel)
+	form.AddCancelButton(noLabel)
+	enableFormNavigation(form, nil)
+
+	content := tview.NewFlex().
+		SetDirection(tview.FlexRow).
+		AddItem(infoText, 0, 1, false).
+		AddItem(countdownText, 1, 0, false).
+		AddItem(form.Form, 3, 0, true)
+
+	page := buildRestoreWizardPage(title, configPath, buildSig, content)
+	form.SetParentView(page)
+
+	stopCh := make(chan struct{})
+	defer close(stopCh)
+
+	if timeout > 0 {
+		go func() {
+			ticker := time.NewTicker(1 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-stopCh:
+					return
+				case <-ctx.Done():
+					cancelled = true
+					app.Stop()
+					return
+				case <-ticker.C:
+					left := time.Until(deadline)
+					if left <= 0 {
+						timedOut = true
+						cancelled = true
+						app.Stop()
+						return
+					}
+					app.QueueUpdateDraw(func() { updateCountdown() })
+				}
+			}
+		}()
+	}
+
+	if err := app.SetRoot(page, true).SetFocus(form.Form).Run(); err != nil {
+		return false, err
+	}
+	if timedOut {
+		logging.DebugStep(logger, "prompt yes/no (tui)", "Timeout expired (%s): proceeding with No", timeout)
+		return false, nil
 	}
 	if cancelled {
 		return false, nil

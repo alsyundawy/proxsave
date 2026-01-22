@@ -425,7 +425,11 @@ CLOUD_ENABLED=false                # true | false
 CLOUD_REMOTE=GoogleDrive                   # remote name from `rclone config`
 CLOUD_REMOTE_PATH=/proxsave/backup         # folder path inside the remote
 
-# Cloud log path (same remote, optional)
+# Cloud log path (optional)
+# Recommended (same remote): path-only (no remote prefix) and no trailing slash
+# CLOUD_LOG_PATH=proxsave/log
+# Legacy / different remote: explicit remote:path
+# CLOUD_LOG_PATH=OtherRemote:proxsave/log
 CLOUD_LOG_PATH=/proxsave/log               # leave empty to disable log uploads
 
 # Legacy compatibility (still supported):
@@ -444,6 +448,20 @@ CLOUD_PARALLEL_VERIFICATION=true   # true | false
 
 # Preflight connectivity check
 CLOUD_WRITE_HEALTHCHECK=false      # true | false (auto-fallback mode vs force write test)
+```
+
+### Recommended Remote Path Formats (Cloud)
+
+To avoid ambiguity, prefer consistent formats:
+- `CLOUD_REMOTE`: remote **name** only (no `:`), e.g. `nextcloud` or `GoogleDrive`.
+- `CLOUD_REMOTE_PATH`: path **inside** the remote (no remote prefix), **no trailing slash** (leading `/` is accepted).
+- `CLOUD_LOG_PATH`: log **folder path**. When logs are on the same remote as backups, prefer **path-only** here too; use `otherremote:/path` only when logs must go to a different remote.
+
+Example (same remote for backups + logs):
+```bash
+CLOUD_REMOTE=nextcloud-katerasrael
+CLOUD_REMOTE_PATH=B+K/BACKUP/marcellus
+CLOUD_LOG_PATH=B+K/BACKUP/marcellus/logs
 ```
 
 ### Connectivity Check Modes
@@ -530,7 +548,7 @@ Quick comparison to help you choose the right storage configuration:
 
 ```bash
 # Connection timeout (seconds)
-RCLONE_TIMEOUT_CONNECTION=30       # Remote accessibility check
+RCLONE_TIMEOUT_CONNECTION=30       # Remote accessibility check (also used for restore/decrypt cloud scan)
 
 # Operation timeout (seconds)
 RCLONE_TIMEOUT_OPERATION=300       # Upload/download operations (5 minutes default)
@@ -553,7 +571,7 @@ RCLONE_FLAGS="--checkers=4 --stats=0 --drive-use-trash=false --drive-pacer-min-s
 
 ### Timeout Tuning
 
-- **CONNECTION**: Short timeout for quick accessibility check (default 30s)
+- **CONNECTION**: Short timeout for quick accessibility check (default 30s); also caps restore/decrypt cloud scanning (listing backups + reading manifests)
 - **OPERATION**: Long timeout for large file uploads (increase for slow networks)
 
 ### Bandwidth Limit Format
@@ -868,7 +886,7 @@ METRICS_PATH=${BASE_DIR}/metrics   # Empty = /var/lib/prometheus/node-exporter
 
 ```bash
 # Cluster configuration
-BACKUP_CLUSTER_CONFIG=true         # /etc/pve/cluster files
+BACKUP_CLUSTER_CONFIG=true         # Cluster config + runtime (corosync, pvecm status/nodes, HA status)
 
 # PVE firewall rules
 BACKUP_PVE_FIREWALL=true           # PVE firewall configuration

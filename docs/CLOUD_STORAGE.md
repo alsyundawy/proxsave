@@ -339,7 +339,7 @@ This is sufficient to start! Other options use sensible defaults.
 # Cloud storage
 CLOUD_ENABLED=true
 CLOUD_REMOTE=GoogleDrive
-CLOUD_REMOTE_PATH=/proxsave/backup   # Complete folder path inside the remote
+CLOUD_REMOTE_PATH=/proxsave/backup   # Folder path inside the remote
 CLOUD_LOG_PATH=/proxsave/log         # Optional: log folder inside the same remote
 
 # Upload mode
@@ -377,13 +377,13 @@ RETENTION_YEARLY=3
 |----------|---------|-------------|
 | `CLOUD_ENABLED` | `false` | Enable cloud storage |
 | `CLOUD_REMOTE` | _(required)_ | rclone remote **name** from `rclone config` (legacy `remote:path` still supported) |
-| `CLOUD_REMOTE_PATH` | _(empty)_ | Full folder path/prefix inside the remote (e.g., `/proxsave/backup`) |
-| `CLOUD_LOG_PATH` | _(empty)_ | Optional log folder on the same remote (set `remote:/path` only when using a different remote) |
+| `CLOUD_REMOTE_PATH` | _(empty)_ | Folder path/prefix inside the remote (e.g., `/proxsave/backup`) |
+| `CLOUD_LOG_PATH` | _(empty)_ | Optional log folder (recommended: path-only on the same remote; use `otherremote:/path` only when using a different remote) |
 | `CLOUD_UPLOAD_MODE` | `parallel` | `parallel` or `sequential` |
 | `CLOUD_PARALLEL_MAX_JOBS` | `2` | Max concurrent uploads (parallel mode) |
 | `CLOUD_PARALLEL_VERIFICATION` | `true` | Verify checksums after upload |
 | `CLOUD_WRITE_HEALTHCHECK` | `false` | Use write test for connectivity check |
-| `RCLONE_TIMEOUT_CONNECTION` | `30` | Connection timeout (seconds) |
+| `RCLONE_TIMEOUT_CONNECTION` | `30` | Connection timeout (seconds). Also used by restore/decrypt when scanning cloud backups (list + manifest read). |
 | `RCLONE_TIMEOUT_OPERATION` | `300` | Operation timeout (seconds) |
 | `RCLONE_BANDWIDTH_LIMIT` | _(empty)_ | Upload rate limit (e.g., `5M` = 5 MB/s) |
 | `RCLONE_TRANSFERS` | `4` | Number of parallel transfers |
@@ -394,6 +394,29 @@ RETENTION_YEARLY=3
 | `MAX_CLOUD_BACKUPS` | `30` | Simple retention (ignored if GFS enabled) |
 
 For complete configuration reference, see: **[Configuration Guide](CONFIGURATION.md)**
+
+### Recommended Remote Path Formats (Important)
+
+ProxSave supports both “new style” (path-only) and “legacy style” (`remote:path`) values, but using a consistent format avoids confusion.
+
+**Recommended:**
+- `CLOUD_REMOTE` should be just the **remote name** (no `:`), e.g. `nextcloud` or `GoogleDrive`.
+- `CLOUD_REMOTE_PATH` should be a **path inside the remote** (no remote prefix). Use **no trailing slash**. A leading `/` is accepted.
+- `CLOUD_LOG_PATH` should be a **folder path** for logs. When logs are stored on the **same remote**, prefer **path-only** here too (no remote prefix). Use `otherremote:/path` only if logs must go to a different remote than `CLOUD_REMOTE`.
+
+**Examples (same remote):**
+```bash
+CLOUD_REMOTE=nextcloud-katerasrael
+CLOUD_REMOTE_PATH=B+K/BACKUP/marcellus
+CLOUD_LOG_PATH=B+K/BACKUP/marcellus/logs
+```
+
+**Examples (different remotes for backups vs logs):**
+```bash
+CLOUD_REMOTE=nextcloud-backups
+CLOUD_REMOTE_PATH=proxsave/backup/host1
+CLOUD_LOG_PATH=nextcloud-logs:proxsave/log/host1
+```
 
 ### Understanding CLOUD_REMOTE vs CLOUD_REMOTE_PATH
 
@@ -414,6 +437,7 @@ path inside the remote, and uses that consistently for:
 - **uploads** (cloud backend);
 - **cloud retention**;
 - **restore / decrypt menus** (entry “Cloud backups (rclone)”).
+  - Restore/decrypt cloud scanning is protected by `RCLONE_TIMEOUT_CONNECTION` (increase it on slow remotes or very large directories).
 
 You can choose the style you prefer; they are equivalent from the tool’s point of view.
 
@@ -593,6 +617,7 @@ rm /tmp/test*.txt
 | `couldn't find configuration section 'gdrive'` | Remote not configured | `rclone config` → create remote |
 | `401 unauthorized` | Credentials expired | `rclone config reconnect gdrive` or regenerate keys |
 | `connection timeout (30s)` | Slow network | Increase `RCLONE_TIMEOUT_CONNECTION=60` |
+| `Timed out while scanning ... (rclone)` | Slow remote / huge directory | Increase `RCLONE_TIMEOUT_CONNECTION` and re-try restore/decrypt scan |
 | `operation timeout (300s exceeded)` | Large file + slow network | Increase `RCLONE_TIMEOUT_OPERATION=900` |
 | `429 Too Many Requests` | API rate limiting | Reduce `RCLONE_TRANSFERS=2`, increase `CLOUD_BATCH_PAUSE=3` |
 | `directory not found` | Path doesn't exist | `rclone mkdir gdrive:pbs-backups` |
