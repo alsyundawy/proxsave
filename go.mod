@@ -2,11 +2,11 @@ module github.com/tis24dev/proxsave
 
 go 1.25
 
-toolchain go1.25.5
+toolchain go1.25.6
 
 require (
 	filippo.io/age v1.3.1
-	github.com/gdamore/tcell/v2 v2.13.7
+	github.com/gdamore/tcell/v2 v2.13.8
 	github.com/rivo/tview v0.42.0
 	golang.org/x/crypto v0.47.0
 	golang.org/x/term v0.39.0
