@@ -115,7 +115,7 @@ Each category is handled in one of three ways:
 | `maintenance_pbs` | PBS Maintenance | Maintenance settings | `./etc/proxmox-backup/maintenance.cfg` |
 | `pbs_jobs` | PBS Jobs | **Staged** sync/verify/prune jobs | `./etc/proxmox-backup/sync.cfg`<br>`./etc/proxmox-backup/verification.cfg`<br>`./etc/proxmox-backup/prune.cfg` |
 | `pbs_remotes` | PBS Remotes | **Staged** remotes for sync/verify (may include credentials) | `./etc/proxmox-backup/remote.cfg` |
-| `pbs_notifications` | PBS Notifications | **Staged** notification targets and matchers | `./etc/proxmox-backup/notifications.cfg`<br>`./etc/proxmox-backup/notifications-priv.cfg` |
+| `pbs_notifications` | PBS Notifications | **Staged** notification targets and matchers (atomic file apply; verified/repaired via `proxmox-backup-manager` when available) | `./etc/proxmox-backup/notifications.cfg`<br>`./etc/proxmox-backup/notifications-priv.cfg` |
 | `pbs_access_control` | PBS Access Control | **Staged** access control + secrets restored 1:1 (root@pam safety rail) | `./etc/proxmox-backup/user.cfg`<br>`./etc/proxmox-backup/domains.cfg`<br>`./etc/proxmox-backup/acl.cfg`<br>`./etc/proxmox-backup/token.cfg`<br>`./etc/proxmox-backup/shadow.json`<br>`./etc/proxmox-backup/token.shadow`<br>`./etc/proxmox-backup/tfa.json` |
 | `pbs_tape` | PBS Tape Backup | **Staged** tape config, jobs and encryption keys | `./etc/proxmox-backup/tape.cfg`<br>`./etc/proxmox-backup/tape-job.cfg`<br>`./etc/proxmox-backup/media-pool.cfg`<br>`./etc/proxmox-backup/tape-encryption-keys.json` |
 
